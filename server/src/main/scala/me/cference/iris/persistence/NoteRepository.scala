@@ -36,7 +36,7 @@ final case class ScanSummary(
  * without `.md`), else a unique case-insensitive basename match, else unresolved (`NULL` — data,
  * not an error). Upserting or deleting a note re-resolves the links that could point at it.
  */
-final class NoteRepository(ds: DataSource):
+final class NoteRepository(ds: DataSource) extends NoteQueries:
 
   /** All indexed note metadata, for the scanner's cheap change comparison. */
   def allMeta(): Map[String, IndexedMeta] =
@@ -102,6 +102,228 @@ final class NoteRepository(ds: DataSource):
         rs.getLong(1)
       finally stmt.close()
     }
+
+  // --- read surface (NoteQueries) -----------------------------------------------
+
+  override def listNotes(
+      folder: Option[String],
+      tag: Option[String],
+      limit: Int,
+      offset: Int
+  ): NoteListPage =
+    withConnection { conn =>
+      val clauses = new StringBuilder(" WHERE 1=1")
+      folder.foreach(_ => clauses.append(" AND (n.folder = ? OR n.folder LIKE ?)"))
+      tag.foreach(_ =>
+        clauses.append(
+          " AND EXISTS (SELECT 1 FROM note_tags t WHERE t.path = n.path AND t.tag = ?)"
+        )
+      )
+      val sql =
+        s"""SELECT n.path, n.name, n.folder, n.content_hash, n.size_bytes, n.modified_at,
+           |       count(*) OVER() AS total
+           |FROM notes n${clauses.toString}
+           |ORDER BY n.path
+           |LIMIT ? OFFSET ?""".stripMargin
+      val ps = conn.prepareStatement(sql)
+      try
+        var i = 1
+        folder.foreach { f =>
+          val base = f.stripSuffix("/")
+          ps.setString(i, base); i += 1
+          ps.setString(i, s"$base/%"); i += 1
+        }
+        tag.foreach { t =>
+          ps.setString(i, t.toLowerCase); i += 1
+        }
+        ps.setInt(i, limit); i += 1
+        ps.setInt(i, offset)
+        val rs = ps.executeQuery()
+        var total = 0L
+        val rows = Vector.newBuilder[NoteSummary]
+        while rs.next() do
+          total = rs.getLong("total")
+          rows += NoteSummary(
+            path = rs.getString("path"),
+            name = rs.getString("name"),
+            folder = rs.getString("folder"),
+            tags = Vector.empty, // filled below in one pass
+            contentHash = rs.getString("content_hash").trim,
+            sizeBytes = rs.getLong("size_bytes"),
+            modifiedAt = rs.getTimestamp("modified_at").toInstant
+          )
+        val page = rows.result()
+        NoteListPage(total, attachTags(conn, page))
+      finally ps.close()
+    }
+
+  private def attachTags(conn: Connection, page: Vector[NoteSummary]): Vector[NoteSummary] =
+    if page.isEmpty then page
+    else
+      val ps = conn.prepareStatement(
+        "SELECT path, tag FROM note_tags WHERE path = ANY(?) ORDER BY tag"
+      )
+      try
+        ps.setArray(1, conn.createArrayOf("text", page.map(_.path).toArray))
+        val rs = ps.executeQuery()
+        val byPath = mutable.Map.empty[String, Vector[String]].withDefaultValue(Vector.empty)
+        while rs.next() do
+          val p = rs.getString(1)
+          val t = rs.getString(2)
+          byPath.update(p, (byPath(p) :+ t).distinct)
+        page.map(s => s.copy(tags = byPath(s.path)))
+      finally ps.close()
+
+  override def getNote(path: String): Option[NoteView] =
+    withConnection { conn =>
+      val ps = conn.prepareStatement(
+        """SELECT path, name, folder, content_hash, size_bytes, modified_at,
+          |       frontmatter::text AS fm, frontmatter_raw, frontmatter_error, body
+          |FROM notes WHERE path = ?""".stripMargin
+      )
+      try
+        ps.setString(1, path)
+        val rs = ps.executeQuery()
+        if !rs.next() then None
+        else
+          Some(
+            NoteView(
+              path = rs.getString("path"),
+              name = rs.getString("name"),
+              folder = rs.getString("folder"),
+              frontmatterJson = Option(rs.getString("fm")),
+              frontmatterRaw = Option(rs.getString("frontmatter_raw")),
+              frontmatterError = Option(rs.getString("frontmatter_error")),
+              body = rs.getString("body"),
+              tags = tagsOf(conn, path),
+              links = linksOf(conn, path),
+              backlinks = backlinksOf(conn, path),
+              contentHash = rs.getString("content_hash").trim,
+              sizeBytes = rs.getLong("size_bytes"),
+              modifiedAt = rs.getTimestamp("modified_at").toInstant
+            )
+          )
+      finally ps.close()
+    }
+
+  private def tagsOf(conn: Connection, path: String): Vector[TagOnNote] =
+    val ps = conn.prepareStatement(
+      "SELECT tag, raw, source FROM note_tags WHERE path = ? ORDER BY tag, source"
+    )
+    try
+      ps.setString(1, path)
+      val rs = ps.executeQuery()
+      val out = Vector.newBuilder[TagOnNote]
+      while rs.next() do out += TagOnNote(rs.getString(1), rs.getString(2), rs.getString(3))
+      out.result()
+    finally ps.close()
+
+  private def linksOf(conn: Connection, path: String): Vector[LinkView] =
+    val ps = conn.prepareStatement(
+      """SELECT raw_target, header, alias, embed, resolved_path
+        |FROM note_links WHERE source_path = ? ORDER BY ordinal""".stripMargin
+    )
+    try
+      ps.setString(1, path)
+      val rs = ps.executeQuery()
+      val out = Vector.newBuilder[LinkView]
+      while rs.next() do
+        out += LinkView(
+          rawTarget = rs.getString(1),
+          header = Option(rs.getString(2)),
+          alias = Option(rs.getString(3)),
+          embed = rs.getBoolean(4),
+          resolvedPath = Option(rs.getString(5))
+        )
+      out.result()
+    finally ps.close()
+
+  private def backlinksOf(conn: Connection, path: String): Vector[BacklinkView] =
+    val ps = conn.prepareStatement(
+      """SELECT DISTINCT source_path, alias FROM note_links
+        |WHERE resolved_path = ? ORDER BY source_path""".stripMargin
+    )
+    try
+      ps.setString(1, path)
+      val rs = ps.executeQuery()
+      val out = Vector.newBuilder[BacklinkView]
+      while rs.next() do out += BacklinkView(rs.getString(1), Option(rs.getString(2)))
+      out.result()
+    finally ps.close()
+
+  override def tagCounts(): Vector[TagCount] =
+    withConnection { conn =>
+      val ps = conn.prepareStatement(
+        "SELECT tag, count(DISTINCT path) FROM note_tags GROUP BY tag ORDER BY count(DISTINCT path) DESC, tag"
+      )
+      try
+        val rs = ps.executeQuery()
+        val out = Vector.newBuilder[TagCount]
+        while rs.next() do out += TagCount(rs.getString(1), rs.getLong(2))
+        out.result()
+      finally ps.close()
+    }
+
+  override def unresolvedTargets(): Vector[UnresolvedTarget] =
+    withConnection { conn =>
+      val ps = conn.prepareStatement(
+        """SELECT raw_target, count(DISTINCT source_path) AS refs
+          |FROM note_links
+          |WHERE resolved_path IS NULL AND NOT embed
+          |GROUP BY raw_target ORDER BY refs DESC, raw_target""".stripMargin
+      )
+      try
+        val rs = ps.executeQuery()
+        val out = Vector.newBuilder[UnresolvedTarget]
+        while rs.next() do out += UnresolvedTarget(rs.getString(1), rs.getLong(2))
+        out.result()
+      finally ps.close()
+    }
+
+  override def linkGraph(path: String, depth: Int, nodeCap: Int): Option[LinkGraph] =
+    withConnection { conn =>
+      exactPath(conn, path).map { root =>
+        val nodes = mutable.LinkedHashSet(root)
+        val edges = mutable.LinkedHashSet.empty[(String, String)]
+        var frontier = Vector(root)
+        var d = 0
+        while d < depth && frontier.nonEmpty && nodes.size < nodeCap do
+          val ps = conn.prepareStatement(
+            """SELECT source_path, resolved_path FROM note_links
+              |WHERE resolved_path IS NOT NULL
+              |  AND (source_path = ANY(?) OR resolved_path = ANY(?))""".stripMargin
+          )
+          val next = mutable.LinkedHashSet.empty[String]
+          try
+            val arr = conn.createArrayOf("text", frontier.toArray)
+            ps.setArray(1, arr)
+            ps.setArray(2, arr)
+            val rs = ps.executeQuery()
+            while rs.next() do
+              val s = rs.getString(1)
+              val t = rs.getString(2)
+              if nodes.size < nodeCap || (nodes.contains(s) && nodes.contains(t)) then
+                edges += ((s, t))
+                if !nodes.contains(s) && nodes.size < nodeCap then { nodes += s; next += s }
+                if !nodes.contains(t) && nodes.size < nodeCap then { nodes += t; next += t }
+          finally ps.close()
+          frontier = next.toVector
+          d += 1
+        // Drop edges that reference a node the cap excluded.
+        val kept = edges.toVector.filter { case (s, t) => nodes.contains(s) && nodes.contains(t) }
+        LinkGraph(
+          root = root,
+          nodes = nodes.toVector.map(p => GraphNode(p, basename(p))),
+          edges = kept.map { case (s, t) => GraphEdge(s, t) }
+        )
+      }
+    }
+
+  private def basename(path: String): String =
+    val file = path.substring(path.lastIndexOf('/') + 1)
+    file.lastIndexOf('.') match
+      case -1 | 0 => file
+      case i => file.substring(0, i)
 
   // --- note row -----------------------------------------------------------------
 

@@ -2,13 +2,14 @@ package me.cference.iris
 
 import me.cference.iris.build.BuildInfo
 import me.cference.iris.config.AppConfig
-import me.cference.iris.http.{HealthRoutes, HttpServer}
+import me.cference.iris.http.{HealthRoutes, HttpServer, NoteRoutes, RequestTracing}
 import me.cference.iris.persistence.{Db, NoteRepository, SchemaMigrator}
 import me.cference.iris.scan.IndexReconciler
 import com.typesafe.config.ConfigFactory
 import org.apache.pekko.actor.typed.ActorSystem
 import org.apache.pekko.actor.typed.scaladsl.Behaviors
 import org.apache.pekko.http.scaladsl.Http.ServerBinding
+import org.apache.pekko.http.scaladsl.server.Directives.*
 import org.slf4j.LoggerFactory
 
 import java.nio.file.Files
@@ -55,7 +56,20 @@ object Main:
     // Readiness flips UP once the server is bound; withdrawn first on shutdown. Queries serve the
     // PRIOR index while the initial scan runs — health does not wait on the vault.
     val readiness = new AtomicBoolean(false)
-    val routes = HealthRoutes(BuildInfo.version, () => readiness.get())
+    // Reindex requests run on the system EC; the reconciler serializes nothing yet because
+    // phase 1 has exactly one writer of the index (this process).
+    val triggerReindex: () => Unit = () =>
+      Future {
+        try
+          reconciler.fullScan()
+          ()
+        catch case NonFatal(e) => log.error(s"reindex failed: ${e.getMessage}", e)
+      }
+      ()
+    val routes = RequestTracing.withCorrelationId(
+      HealthRoutes(BuildInfo.version, () => readiness.get()) ~
+        NoteRoutes(repo, triggerReindex).routes
+    )
 
     HttpServer.bind(routes, cfg.http.host, cfg.http.port).onComplete {
       case Success(binding: ServerBinding) =>
