@@ -36,6 +36,8 @@ iris pod
 ## Phase-1 safety posture (why this shape cannot harm the vault)
 
 1. `ob sync-config` mode **pull-only** — the sidecar never pushes local changes to the real vault.
+   **Must be enforced fail-closed, not merely set once (added 2026-08-26).** See the section
+   below: this is the only one of the four layers that can silently stop being true.
 2. The iris container's mount is **read-only** — it cannot write even if it wanted to.
 3. Iris's own code never opens a vault file for writing (review-enforced; all I/O funnels through
    the scanner).
@@ -52,6 +54,30 @@ iris pod
    - `ob sync-config` → set mode pull-only.
    - `ob sync` once; verify `/vault/vault` fills.
 3. Flip the sidecar to `ob sync --continuous`; restart the pod.
+
+## Pull-only must fail closed (safety defect found 2026-08-26, in the first chart draft)
+
+The other three no-harm layers are structural: a kernel mount flag, the absence of a write path
+in the code, a design property. **Pull-only is a human running one command once**, persisted as
+CLI state inside `ob-state/` — the only layer that can quietly stop being true.
+
+Worse, layers 1 and 4 interact. The mirror is deliberately disposable, and the stated recovery
+story is "wipe it, a fresh sync rebuilds it." That is safe **only because** pull-only stops local
+deletions propagating. Invert it — a fresh or wiped PVC, a re-run bootstrap where the
+`sync-config` step is skipped or fat-fingered — and an empty-or-partial mirror syncs
+bidirectionally against the real vault. Disposability becomes the delivery mechanism for mass
+deletion of the thing this design exists to protect, and it fails **silently**: healthy sidecar,
+no error, mirror looks correct.
+
+**Requirement:** the sidecar must not trust persisted state. On every container start it should
+re-assert pull-only (idempotent), then *verify* the effective mode and **exit non-zero if it is
+not pull-only**, so the pod crashloops loudly rather than syncing bidirectionally. Fail closed —
+"when in doubt, read-only" applied to the sync layer itself.
+
+**Blocked on:** the exact `ob sync-config` set/read flag syntax, which is unknown here (the
+published docs name the modes `pull-only` and `mirror-remote` but not the precise flags).
+Capturing that syntax is a deliverable of the `ob login` probe below, alongside the session
+question.
 
 **OPEN QUESTION (probe before first deploy):** where the CLI persists the *account login session*
 is undocumented (only sync `--config-dir`, default `.obsidian` in the vault, is documented). The
