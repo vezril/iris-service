@@ -3,6 +3,23 @@ vault/
 *.md.snapshot
 vault-access.local.*
 .env
+
+# scala / sbt
+target/
+.bloop/
+.metals/
+.bsp/
+.scala-build/
+project/project/
+project/target/
+metals.sbt
+
+# editors / os
+.idea/
+.vscode/
+.DS_Store
+
+# misc toolchains
 __pycache__/
 *.pyc
 node_modules/
