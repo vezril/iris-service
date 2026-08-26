@@ -69,7 +69,8 @@ IRIS_VAULT_ROOT=$HOME/Mindmap sbt server/run
 
 **Vault access (decided 2026-08-26, supersedes the deferred V1/V2 fork):** the official
 **headless Obsidian Sync CLI** (`obsidian-headless`, open beta) runs as a sidecar container in
-the iris pod, pulling the vault into a shared PVC in **pull-only mode**; the service container
+the iris pod, pulling the vault into a shared PVC in **download-only `mirror-remote` mode**
+(never pushes; reverts local divergence); the service container
 mounts it read-only. The mirror is disposable — a fresh sync rebuilds it. The Helm chart lives
 in the codex repo (`codex/charts/iris`), not here.
 
