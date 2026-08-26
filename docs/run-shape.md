@@ -43,17 +43,29 @@ iris pod
    the scanner).
 4. The mirror and the index are both disposable and rebuildable.
 
-## One-time bootstrap runbook (manual)
+## Bootstrap (revised 2026-08-26 — no `kubectl exec` needed)
 
-1. Deploy with the sidecar command held (e.g. `sleep infinity`).
-2. `kubectl exec -it` into `obsidian-sync`:
-   - `ob login` (interactive — Obsidian account credentials, possibly MFA; Calvin drives this).
-   - `ob sync-list-remote` → confirm the vault name.
-   - `ob sync-setup --vault "<vault>" --path /vault/vault --password <E2EE sync password>`
-     (the sync password can come from a Secret env; do NOT bake it in values).
-   - `ob sync-config` → set mode pull-only.
-   - `ob sync` once; verify `/vault/vault` fills.
-3. Flip the sidecar to `ob sync --continuous`; restart the pod.
+Every command that bootstrap needs takes flags, so the only step requiring a human is minting
+the token, and that happens **once, on Calvin's own machine**:
+
+1. **Calvin, locally:** `ob login` (email + password + MFA — prompted, or via `--email`
+   `--password` `--mfa`). Then read the minted token from
+   `~/.obsidian-headless/auth_token` on macOS.
+2. **Two Secrets** (values never in chart values): `OBSIDIAN_AUTH_TOKEN` from step 1, and the
+   E2EE sync password.
+3. **The sidecar bootstraps itself** on start, non-interactively:
+
+```
+ob sync-setup  --vault "<vault>" --path /vault/vault --password "$OBSIDIAN_SYNC_PASSWORD"
+ob sync-config --path /vault/vault --mode pull-only
+ob sync-status --path /vault/vault --json     # assert mode is pull-only, else exit 1
+ob sync        --path /vault/vault --continuous
+```
+
+That is the fail-closed wrapper and the bootstrap in one: re-asserting the mode on every start
+is exactly what stops a wiped PVC from silently reverting to `bidirectional`, and `sync-setup`
+is idempotent enough to re-run against existing state. The `sidecar.bootstrap` gate can stay as
+an escape hatch for manual intervention, but it is no longer the normal path.
 
 ## Pull-only must fail closed (safety defect found 2026-08-26, in the first chart draft)
 
@@ -74,15 +86,45 @@ re-assert pull-only (idempotent), then *verify* the effective mode and **exit no
 not pull-only**, so the pod crashloops loudly rather than syncing bidirectionally. Fail closed —
 "when in doubt, read-only" applied to the sync layer itself.
 
-**Blocked on:** the exact `ob sync-config` set/read flag syntax, which is unknown here (the
-published docs name the modes `pull-only` and `mirror-remote` but not the precise flags).
-Capturing that syntax is a deliverable of the `ob login` probe below, alongside the session
-question.
+**Syntax (probed 2026-08-26, `obsidian-headless` 0.0.14 — no longer blocked):**
 
-**OPEN QUESTION (probe before first deploy):** where the CLI persists the *account login session*
-is undocumented (only sync `--config-dir`, default `.obsidian` in the vault, is documented). The
-`HOME=/vault/ob-state` assumption must be verified by running `ob login` locally and diffing
-`$HOME`. If the session lands elsewhere, move that dir onto the PVC too.
+```
+ob sync-config --path /vault/vault --mode pull-only    # set
+ob sync-status --path /vault/vault --json              # read back, for the assertion
+```
+
+`--mode` takes `bidirectional`, `pull-only` (only download, ignore local changes), or
+`mirror-remote` (only download, revert local changes). **`bidirectional` is the DEFAULT** — the
+dangerous mode is what you get by omission, which is the whole argument for fail-closed.
+
+`mirror-remote` is worth considering over `pull-only`: both are download-only, but it actively
+reverts local divergence instead of ignoring it. Since Iris never writes the mirror, either is
+correct; `mirror-remote` is the more self-healing of the two.
+
+**RESOLVED 2026-08-26** (read from `obsidian-headless` 0.0.14's own source, no login required).
+The CLI keeps all state in one config directory:
+
+- **Linux** (the container): `$XDG_CONFIG_HOME/obsidian-headless`, defaulting to
+  `~/.config/obsidian-headless`.
+- **macOS/other**: `~/.obsidian-headless` (note: *not* `~/.config`).
+
+Contents: `auth_token` (the account session), `sync/<vault>/config.json` (per-vault sync
+configuration — **including the mode**), and `publish/` (irrelevant here).
+
+Two consequences:
+
+1. **The `HOME=/vault/ob-state` assumption holds.** On Linux with that HOME, state lands at
+   `/vault/ob-state/.config/obsidian-headless/` — on the PVC, surviving restarts. No layout
+   change needed.
+2. **`OBSIDIAN_AUTH_TOKEN` overrides the file entirely** — the source checks the env var first
+   and returns it directly. So the session can come from a **k8s Secret** instead of persisted
+   volume state: it then survives PVC loss, and matches the constellation's secrets-in-Secrets
+   convention rather than trusting a disposable volume.
+
+**This also confirms the fail-closed defect concretely.** The pull-only mode is stored in
+`sync/<vault>/config.json` *inside that same config dir*, i.e. on the PVC we call disposable. Wipe
+the PVC, re-run setup without `--mode`, and you silently get `bidirectional`. The predicted
+failure mode has a file path.
 
 ## Resource asks
 
