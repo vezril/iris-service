@@ -31,7 +31,16 @@ final case class ScanConfig(
     rescanInterval: FiniteDuration
 )
 
-final case class AppConfig(http: HttpConfig, vault: VaultConfig, db: DbConfig, scan: ScanConfig)
+/** The change-feed switch (real publishing waits on the lexicon contract + topics). */
+final case class HermesConfig(enabled: Boolean)
+
+final case class AppConfig(
+    http: HttpConfig,
+    vault: VaultConfig,
+    db: DbConfig,
+    scan: ScanConfig,
+    hermes: HermesConfig
+)
 
 object AppConfig:
 
@@ -55,5 +64,6 @@ object AppConfig:
         watchEnabled = scan.getBoolean("watch-enabled"),
         debounce = scan.getDuration("debounce").toMillis.millis,
         rescanInterval = scan.getDuration("rescan-interval").toMillis.millis
-      )
+      ),
+      HermesConfig(enabled = raw.getBoolean("iris.hermes.enabled"))
     )

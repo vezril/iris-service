@@ -1,8 +1,9 @@
 package me.cference.iris.scan
 
-import me.cference.iris.domain.VaultPath
+import me.cference.iris.domain.{Note, VaultPath}
+import me.cference.iris.hermes.{VaultEventKind, VaultEventPublisher, VaultNoteEvent}
 import me.cference.iris.parse.NoteParser
-import me.cference.iris.persistence.{NoteRepository, ScanSummary}
+import me.cference.iris.persistence.{IndexedMeta, NoteRepository, ScanSummary}
 import org.slf4j.LoggerFactory
 
 import java.nio.file.{Files, Path}
@@ -17,9 +18,40 @@ import scala.util.control.NonFatal
  * Reads tolerate the sync sidecar's undocumented write pattern: a file that vanishes or errors
  * mid-read is logged, counted, and left for the next pass — never a crash, never a partial note.
  */
-final class IndexReconciler(root: Path, repo: NoteRepository):
+final class IndexReconciler(
+    root: Path,
+    repo: NoteRepository,
+    publisher: VaultEventPublisher = VaultEventPublisher.NoOp
+):
 
   private val log = LoggerFactory.getLogger(getClass)
+
+  /** Events fire strictly after the index transaction committed. */
+  private def emit(kind: VaultEventKind, note: Note, previousHash: String): Unit =
+    publisher.publish(
+      VaultNoteEvent(
+        kind = kind,
+        path = note.path,
+        contentHash = if kind == VaultEventKind.Deleted then "" else note.contentHash.value,
+        previousHash = previousHash,
+        modifiedAt = note.modifiedAt,
+        tags = note.tags.toVector.map(_.tag.normalized).distinct.sorted,
+        observedAt = Instant.now()
+      )
+    )
+
+  private def emitDeleted(path: VaultPath, prior: Option[IndexedMeta]): Unit =
+    publisher.publish(
+      VaultNoteEvent(
+        kind = VaultEventKind.Deleted,
+        path = path,
+        contentHash = "",
+        previousHash = prior.map(_.contentHash).getOrElse(""),
+        modifiedAt = prior.map(_.modifiedAt).getOrElse(Instant.now()),
+        tags = Vector.empty,
+        observedAt = Instant.now()
+      )
+    )
 
   def fullScan(kind: String = "full"): ScanSummary =
     val startedAt = Instant.now()
@@ -32,9 +64,16 @@ final class IndexReconciler(root: Path, repo: NoteRepository):
     var errors = 0
 
     changes.createdOrChanged.foreach { fm =>
+      val prior = indexed.get(fm.path.value)
       readAndIndex(fm.path) match
-        case ReadOutcome.Indexed =>
-          if indexed.contains(fm.path.value) then changed += 1 else created += 1
+        case ReadOutcome.Indexed(note) =>
+          prior match
+            case Some(m) =>
+              changed += 1
+              emit(VaultEventKind.Changed, note, m.contentHash)
+            case None =>
+              created += 1
+              emit(VaultEventKind.Created, note, "")
         case ReadOutcome.Skipped => ()
         case ReadOutcome.Failed => errors += 1
     }
@@ -44,6 +83,7 @@ final class IndexReconciler(root: Path, repo: NoteRepository):
         case Right(vp) =>
           repo.delete(vp)
           log.info("deleted from index: {}", p)
+          emitDeleted(vp, indexed.get(p))
         case Left(_) => errors += 1
     }
 
@@ -89,10 +129,14 @@ final class IndexReconciler(root: Path, repo: NoteRepository):
           else
             repo.upsert(note)
             log.info("watch: indexed {}", vp.value)
+            indexed match
+              case Some(m) => emit(VaultEventKind.Changed, note, m.contentHash)
+              case None => emit(VaultEventKind.Created, note, "")
             true
         else if indexed.isDefined then
           repo.delete(vp)
           log.info("watch: deleted {}", vp.value)
+          emitDeleted(vp, indexed)
           true
         else false
       catch
@@ -101,7 +145,9 @@ final class IndexReconciler(root: Path, repo: NoteRepository):
           false
 
   private enum ReadOutcome:
-    case Indexed, Skipped, Failed
+    case Indexed(note: Note)
+    case Skipped
+    case Failed
 
   private def readAndIndex(vp: VaultPath): ReadOutcome =
     val file = root.resolve(vp.value)
@@ -112,7 +158,7 @@ final class IndexReconciler(root: Path, repo: NoteRepository):
         val mtime = VaultScanner.storedPrecision(Files.getLastModifiedTime(file).toInstant)
         val note = NoteParser.parse(vp, bytes, mtime)
         repo.upsert(note)
-        ReadOutcome.Indexed
+        ReadOutcome.Indexed(note)
     catch
       case NonFatal(e) =>
         log.warn("failed to index {}: {} — will retry next scan", vp.value, e.getMessage)

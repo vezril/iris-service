@@ -51,7 +51,11 @@ object Main:
 
     val pool = Db.pool(cfg.db)
     val repo = NoteRepository(pool)
-    val reconciler = IndexReconciler(cfg.vault.root, repo)
+    // Until the lexicon contract + topics exist, "enabled" logs the wire shape instead of sending.
+    val publisher =
+      if cfg.hermes.enabled then hermes.VaultEventPublisher.Logging()
+      else hermes.VaultEventPublisher.NoOp
+    val reconciler = IndexReconciler(cfg.vault.root, repo, publisher)
 
     // Readiness flips UP once the server is bound; withdrawn first on shutdown. Queries serve the
     // PRIOR index while the initial scan runs — health does not wait on the vault.

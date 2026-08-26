@@ -19,7 +19,11 @@ class IndexReconcilerSpec extends AnyWordSpec with Matchers with TestContainerFo
   override val containerDef: PostgreSQLContainer.Def =
     PostgreSQLContainer.Def(DockerImageName.parse("postgres:16"))
 
-  private def withFixture[A](c: Containers)(f: (Path, NoteRepository, IndexReconciler) => A): A =
+  private def withFixture[A](
+      c: Containers,
+      publisher: me.cference.iris.hermes.VaultEventPublisher =
+        me.cference.iris.hermes.VaultEventPublisher.NoOp
+  )(f: (Path, NoteRepository, IndexReconciler) => A): A =
     val cfg = DbConfig(c.jdbcUrl, c.username, c.password, 30.seconds)
     SchemaMigrator.migrate(cfg).left.foreach(e => fail(e.message))
     val hc = new HikariConfig()
@@ -31,7 +35,7 @@ class IndexReconcilerSpec extends AnyWordSpec with Matchers with TestContainerFo
     val root = Files.createTempDirectory("iris-reconciler-spec")
     try
       val repo = NoteRepository(ds)
-      f(root, repo, IndexReconciler(root, repo))
+      f(root, repo, IndexReconciler(root, repo, publisher))
     finally
       ds.close()
       Files.walk(root).sorted(Comparator.reverseOrder()).forEach(p => Files.delete(p))
@@ -62,6 +66,36 @@ class IndexReconcilerSpec extends AnyWordSpec with Matchers with TestContainerFo
           second.changed shouldBe 0
           second.deleted shouldBe 0
         }
+    }
+
+    "emit created/changed/deleted events with chained hashes, after commit" in withContainers { c =>
+      val events =
+        scala.collection.mutable.ArrayBuffer.empty[me.cference.iris.hermes.VaultNoteEvent]
+      val recorder = new me.cference.iris.hermes.VaultEventPublisher:
+        def publish(e: me.cference.iris.hermes.VaultNoteEvent): Unit = events += e
+      withFixture(c, recorder) { (root, repo, reconciler) =>
+        write(root, "e.md", "v1")
+        reconciler.fullScan()
+        write(root, "e.md", "v2 with more bytes")
+        reconciler.fullScan()
+        java.nio.file.Files.delete(root.resolve("e.md"))
+        reconciler.fullScan()
+
+        import me.cference.iris.hermes.VaultEventKind
+        // The suite shares one database: earlier tests' leftovers emit their own
+        // deletions on the first scan, so assertions scope to this test's note.
+        val mine = events.toVector.filter(_.path.value == "e.md")
+        mine.map(_.kind) shouldBe Vector(
+          VaultEventKind.Created,
+          VaultEventKind.Changed,
+          VaultEventKind.Deleted
+        )
+        val Vector(created, changed, deleted) = mine: @unchecked
+        created.previousHash shouldBe ""
+        changed.previousHash shouldBe created.contentHash // the chain consumers rely on
+        deleted.previousHash shouldBe changed.contentHash
+        deleted.contentHash shouldBe ""
+      }
     }
 
     "pick up edits and deletes" in withContainers { c =>
