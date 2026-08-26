@@ -3,6 +3,8 @@ package me.cference.iris.config
 import com.typesafe.config.Config
 
 import java.nio.file.Path
+import scala.concurrent.duration.DurationLong
+import scala.concurrent.duration.FiniteDuration
 
 /** Typed view over the `iris.http` config block. */
 final case class HttpConfig(host: String, port: Int)
@@ -14,7 +16,15 @@ final case class HttpConfig(host: String, port: Int)
  */
 final case class VaultConfig(root: Path)
 
-final case class AppConfig(http: HttpConfig, vault: VaultConfig)
+/** The Postgres read model (rebuildable; the vault stays the source of truth). */
+final case class DbConfig(
+    jdbcUrl: String,
+    user: String,
+    password: String,
+    migrateMaxWait: FiniteDuration
+)
+
+final case class AppConfig(http: HttpConfig, vault: VaultConfig, db: DbConfig)
 
 object AppConfig:
 
@@ -22,7 +32,15 @@ object AppConfig:
   def load(raw: Config): AppConfig =
     val http = raw.getConfig("iris.http")
     val vault = raw.getConfig("iris.vault")
+    val db = raw.getConfig("iris.db")
     AppConfig(
       HttpConfig(http.getString("host"), http.getInt("port")),
-      VaultConfig(Path.of(vault.getString("root")))
+      VaultConfig(Path.of(vault.getString("root"))),
+      DbConfig(
+        jdbcUrl =
+          s"jdbc:postgresql://${db.getString("host")}:${db.getInt("port")}/${db.getString("database")}",
+        user = db.getString("user"),
+        password = db.getString("password"),
+        migrateMaxWait = db.getDuration("migrate-max-wait").toMillis.millis
+      )
     )

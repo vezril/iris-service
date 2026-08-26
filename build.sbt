@@ -77,6 +77,9 @@ lazy val server = (project in file("server"))
   .settings(
     name := "iris-server",
     Compile / mainClass := Some("me.cference.iris.Main"),
+    // Forked run: main() returns after wiring async boot; the (non-daemon) Pekko
+    // threads keep the forked JVM alive. Unforked, sbt would exit the app at return.
+    Compile / run / fork := true,
     libraryDependencies ++= Seq(
       "org.apache.pekko" %% "pekko-actor-typed" % pekkoVersion,
       "org.apache.pekko" %% "pekko-stream" % pekkoVersion,
