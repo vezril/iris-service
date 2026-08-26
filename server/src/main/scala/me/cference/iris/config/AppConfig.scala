@@ -24,7 +24,14 @@ final case class DbConfig(
     migrateMaxWait: FiniteDuration
 )
 
-final case class AppConfig(http: HttpConfig, vault: VaultConfig, db: DbConfig)
+/** Watch/rescan cadence. */
+final case class ScanConfig(
+    watchEnabled: Boolean,
+    debounce: FiniteDuration,
+    rescanInterval: FiniteDuration
+)
+
+final case class AppConfig(http: HttpConfig, vault: VaultConfig, db: DbConfig, scan: ScanConfig)
 
 object AppConfig:
 
@@ -33,6 +40,7 @@ object AppConfig:
     val http = raw.getConfig("iris.http")
     val vault = raw.getConfig("iris.vault")
     val db = raw.getConfig("iris.db")
+    val scan = raw.getConfig("iris.scan")
     AppConfig(
       HttpConfig(http.getString("host"), http.getInt("port")),
       VaultConfig(Path.of(vault.getString("root"))),
@@ -42,5 +50,10 @@ object AppConfig:
         user = db.getString("user"),
         password = db.getString("password"),
         migrateMaxWait = db.getDuration("migrate-max-wait").toMillis.millis
+      ),
+      ScanConfig(
+        watchEnabled = scan.getBoolean("watch-enabled"),
+        debounce = scan.getDuration("debounce").toMillis.millis,
+        rescanInterval = scan.getDuration("rescan-interval").toMillis.millis
       )
     )

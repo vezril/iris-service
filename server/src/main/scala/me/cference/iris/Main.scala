@@ -4,7 +4,7 @@ import me.cference.iris.build.BuildInfo
 import me.cference.iris.config.AppConfig
 import me.cference.iris.http.{HealthRoutes, HttpServer, NoteRoutes, RequestTracing}
 import me.cference.iris.persistence.{Db, NoteRepository, SchemaMigrator}
-import me.cference.iris.scan.IndexReconciler
+import me.cference.iris.scan.{IndexReconciler, VaultWatcher}
 import com.typesafe.config.ConfigFactory
 import org.apache.pekko.actor.typed.ActorSystem
 import org.apache.pekko.actor.typed.scaladsl.Behaviors
@@ -81,7 +81,8 @@ object Main:
           Integer.valueOf(binding.localAddress.getPort),
           cfg.vault.root
         )
-        // Initial full scan in the background (blocking I/O off the request path).
+        // Initial full scan in the background (blocking I/O off the request path); the watcher
+        // and the periodic rescan start once the initial pass has the index caught up.
         Future {
           try
             val s = reconciler.fullScan()
@@ -93,8 +94,25 @@ object Main:
           catch
             case NonFatal(e) =>
               log.error(s"initial scan failed: ${e.getMessage}", e)
+        }.foreach { _ =>
+          if cfg.scan.watchEnabled then
+            val watcher =
+              VaultWatcher(cfg.vault.root, reconciler, cfg.scan.debounce, triggerReindex)
+            watcher.start()
+            org.apache.pekko.actor
+              .CoordinatedShutdown(system)
+              .addTask(
+                org.apache.pekko.actor.CoordinatedShutdown.PhaseServiceRequestsDone,
+                "drain-vault-watcher"
+              ) { () =>
+                watcher.drain().map(_ => org.apache.pekko.Done)
+              }
+          system.scheduler
+            .scheduleWithFixedDelay(cfg.scan.rescanInterval, cfg.scan.rescanInterval) { () =>
+              triggerReindex()
+            }
+          ()
         }
-        ()
       case Failure(ex) =>
         log.error(s"Failed to bind HTTP ${cfg.http.host}:${cfg.http.port} — ${ex.getMessage}", ex)
         system.terminate()

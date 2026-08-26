@@ -70,6 +70,36 @@ final class IndexReconciler(root: Path, repo: NoteRepository):
     )
     summary
 
+  /**
+   * Reconcile ONE path against the vault — the watcher's unit of work. Reads current disk state
+   * rather than trusting the event kind: a create/modify/delete race collapses to "what is true
+   * now". Returns true when the index changed.
+   */
+  def reconcilePath(vp: VaultPath): Boolean =
+    if !VaultRules.shouldIndex(vp) then false
+    else
+      val file = root.resolve(vp.value)
+      val indexed = repo.allMeta().get(vp.value)
+      try
+        if Files.isRegularFile(file) then
+          val bytes = Files.readAllBytes(file)
+          val mtime = VaultScanner.storedPrecision(Files.getLastModifiedTime(file).toInstant)
+          val note = NoteParser.parse(vp, bytes, mtime)
+          if indexed.exists(_.contentHash == note.contentHash.value) then false
+          else
+            repo.upsert(note)
+            log.info("watch: indexed {}", vp.value)
+            true
+        else if indexed.isDefined then
+          repo.delete(vp)
+          log.info("watch: deleted {}", vp.value)
+          true
+        else false
+      catch
+        case NonFatal(e) =>
+          log.warn("watch: failed to reconcile {}: {} — rescan will heal", vp.value, e.getMessage)
+          false
+
   private enum ReadOutcome:
     case Indexed, Skipped, Failed
 
