@@ -52,6 +52,27 @@ of personal knowledge. So Iris is conservative by construction:
    per write, conflict surfacing.
 3. **First consumer** — Mnemosyne builds on the proven bridge.
 
+## Development
+
+Scala 3.3.4 + Pekko 1.2.0, two modules: `core/` (pure domain + vault parsing, zero Pekko) and
+`server/` (runtime). Standard gate:
+
+```
+sbt scalafmtAll compile test
+```
+
+Local run against the real vault is safe — phase 1 never opens a file for writing:
+
+```
+IRIS_VAULT_ROOT=$HOME/Mindmap sbt server/run
+```
+
+**Vault access (decided 2026-08-26, supersedes the deferred V1/V2 fork):** the official
+**headless Obsidian Sync CLI** (`obsidian-headless`, open beta) runs as a sidecar container in
+the iris pod, pulling the vault into a shared PVC in **pull-only mode**; the service container
+mounts it read-only. The mirror is disposable — a fresh sync rebuilds it. The Helm chart lives
+in the codex repo (`codex/charts/iris`), not here.
+
 ## Constellation conventions
 
 Owned/coordinated per `codex/docs/session-coordination.md`. Deploys are the Codex session's
