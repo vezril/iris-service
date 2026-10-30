@@ -4,7 +4,7 @@ import me.cference.iris.build.BuildInfo
 import me.cference.iris.config.AppConfig
 import me.cference.iris.http.{HealthRoutes, HttpServer, NoteRoutes, RequestTracing}
 import me.cference.iris.persistence.{Db, NoteRepository, SchemaMigrator}
-import me.cference.iris.scan.{IndexReconciler, VaultWatcher}
+import me.cference.iris.scan.{IndexReconciler, VaultQuiesce, VaultWatcher}
 import com.typesafe.config.ConfigFactory
 import org.apache.pekko.actor.typed.ActorSystem
 import org.apache.pekko.actor.typed.scaladsl.Behaviors
@@ -89,6 +89,10 @@ object Main:
         // and the periodic rescan start once the initial pass has the index caught up.
         Future {
           try
+            // Wait out the sidecar's first download before scanning OR registering the watcher —
+            // both are unreliable against a tree still being written. First-boot only; the
+            // periodic rescan remains the net for later bulk landings.
+            if cfg.scan.quiesce.enabled then quiesceVault(cfg)
             val s = reconciler.fullScan()
             log.info(
               "index holds {} notes after initial scan",
@@ -122,3 +126,21 @@ object Main:
         system.terminate()
         System.exit(1)
     }
+
+  /** Log whichever way the quiesce gate resolved; a timeout is a warning, never a failure. */
+  private def quiesceVault(cfg: AppConfig): Unit =
+    VaultQuiesce.awaitStable(cfg.vault.root, cfg.scan.quiesce) match
+      case VaultQuiesce.Outcome.Stable(fp, waited) =>
+        log.info(
+          "vault mirror settled after {}s: {} notes on disk — starting initial scan",
+          java.lang.Long.valueOf(waited.toSeconds),
+          Integer.valueOf(fp.fileCount)
+        )
+      case VaultQuiesce.Outcome.TimedOut(fp, waited) =>
+        log.warn(
+          "vault mirror still changing after {}s ({} notes on disk) — scanning anyway; the {} "
+            + "rescan heals a short index",
+          java.lang.Long.valueOf(waited.toSeconds),
+          Integer.valueOf(fp.fileCount),
+          cfg.scan.rescanInterval
+        )
