@@ -20,6 +20,15 @@ class NoteRepositorySpec extends AnyWordSpec with Matchers with TestContainerFor
 
   private val now = Instant.parse("2026-08-26T12:00:00Z")
 
+  /**
+   * One container is shared across the suite (`TestContainerForAll`), so every test starts by
+   * emptying the tables. Tests that assert only on rows they inserted themselves survive without
+   * this; tests that assert on AGGREGATES — `count(*)`, `max(modified_at)`, the latest scan row —
+   * read whatever earlier tests left behind, and silently depend on declaration order. Truncating
+   * here rather than per-test makes the whole suite order-independent.
+   *
+   * `notes` cascades to `note_tags` and `note_links`; `scans` is independent.
+   */
   private def withRepo[A](c: Containers)(f: (NoteRepository, HikariDataSource) => A): A =
     val cfg = DbConfig(c.jdbcUrl, c.username, c.password, 30.seconds)
     SchemaMigrator.migrate(cfg).left.foreach(e => fail(e.message))
@@ -29,7 +38,11 @@ class NoteRepositorySpec extends AnyWordSpec with Matchers with TestContainerFor
     hc.setPassword(c.password)
     hc.setMaximumPoolSize(2)
     val ds = new HikariDataSource(hc)
-    try f(NoteRepository(ds), ds)
+    try
+      val conn = ds.getConnection
+      try conn.createStatement().executeUpdate("TRUNCATE notes, scans CASCADE")
+      finally conn.close()
+      f(NoteRepository(ds), ds)
     finally ds.close()
 
   private def note(path: String, text: String): Note =
