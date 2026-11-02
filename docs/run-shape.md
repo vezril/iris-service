@@ -27,8 +27,8 @@ iris pod
 ```
 
 - **PVC `iris-vault`, ~5Gi, local-filesystem storage class (local-path) — NOT NFS.** The watcher
-  uses inotify, which does not fire on NFS; on NFS Iris degrades to its 6h rescans. The vault is
-  ~6k markdown notes + assets (~a few hundred MB today).
+  uses inotify, which does not fire on NFS; on NFS Iris degrades to its periodic rescan (default
+  **30m**, see below). The vault is ~6k markdown notes + assets (~a few hundred MB today).
 - **PVC layout:** `vault/` (the Mindmap mirror — disposable: a fresh sync rebuilds it, the
   Postgres index rebuilds from it) and `ob-state/` (the CLI's HOME: login session + sync state —
   this must survive restarts).
@@ -132,6 +132,32 @@ Two consequences:
 the PVC, re-run setup without `--mode`, and you silently get `bidirectional`. The predicted
 failure mode has a file path.
 
+## The WatchService bulk-creation race (known; two mitigations, one standing)
+
+`WatchService` has an **inherent directory-registration race**: when many files land at once it can
+**silently drop events** — no error, no `OVERFLOW`. The index goes short with no symptom, and a
+missing note is invisible to consumers (Mnemosyne would simply never see it). Observed on first
+deploy: the initial scan saw **63 of 5,917** notes; 31 were missed outright.
+
+Two mitigations, and they are not interchangeable:
+
+1. **Quiesce gate (`iris.scan.quiesce`, default on) — closes the FIRST-BOOT instance only.** Boot
+   holds the initial scan until a stat-only fingerprint of the mirror (file count, total bytes,
+   newest mtime) is unchanged for 3 consecutive 5s polls, capped at 15m. Both the scan *and* the
+   watcher's directory registration then run against a settled tree. An empty tree never counts as
+   settled — that is the first-boot failure itself — and it logs a warning on every poll, so a
+   sidecar that landed nothing is loud rather than a silent 15-minute wait. **Fails open:** at
+   `max-wait` it scans anyway, because serving an empty index is a wrong-but-plausible answer.
+   Readiness never waits on this; queries serve the prior index throughout.
+2. **Periodic rescan (`iris.scan.rescan-interval`, default `30m`) — the STANDING net for the
+   general case.** The gate does nothing for a *later* bulk landing: a Sync backlog after downtime,
+   a vault restructure, a **PVC/mirror rebuild** (a *designed* path — the mirror is disposable), any
+   bulk import. The rescan is the only thing that heals those. Its cost is ~nil (stat-per-file walk,
+   ~0.5s for the full vault, hashing skipped for unchanged files). **Do not relax past `1h`.**
+
+`POST /admin/reindex` forces a full reconcile on demand (it healed the first-boot 31 exactly).
+After any bulk event, verify `postgres index count == mirror .md count` and reindex if short.
+
 ## Resource asks
 
 - sidecar: requests 100m/256Mi, limits 500m/512Mi (Node + Electron-less sync only)
@@ -142,10 +168,50 @@ failure mode has a file path.
 ## Health / observability
 
 - `GET /health` on :8080 (200 UP / 503 during shutdown drain) — probe target.
-- Sidecar liveness: process exit → container restart (k8s default); a wedged-but-alive sync shows
-  up as staleness, which Iris will expose as a `vault_freshness` metric (planned; not yet
-  implemented — flag for Hera later).
+- `GET /metrics` on :8080 — Prometheus text exposition, per `codex/docs/observability.md`
+  (health/metrics on the service port). Content-free: counts, timestamps, scan outcomes only.
+- Sidecar liveness: process exit → container restart (k8s default).
 - Logs: `LOG_FORMAT=json` (the image default) → constellation structured-log shape.
+
+### What the gauges can and cannot tell Hera
+
+The chart README asked for a `vault_freshness` gauge to catch a **wedged-but-alive** sidecar, which
+shows up as staleness rather than a crash. That exact gauge is not honestly implementable from
+inside Iris, so it is decomposed rather than faked. **Iris cannot see the sidecar's sync state** —
+it lives in the CLI's own config dir, and depending on a beta tool's internal state format is not a
+contract worth having.
+
+| Gauge | Strength | Use |
+|---|---|---|
+| `iris_last_scan_timestamp_seconds` | **Strong** | Stops advancing iff *Iris's own* scanning stopped |
+| `iris_last_scan_notes_seen` + `iris_index_notes` | **Strong** | Their difference is the short-index detector |
+| `iris_last_scan_errors` | Strong | Persistent non-zero ⇒ notes missing from the index |
+| `iris_vault_newest_note_timestamp_seconds` | **WEAK** | Dashboard only — see below |
+| `iris_index_queryable` | Strong | 0 ⇒ Iris is up but cannot reach Postgres |
+
+Suggested alerts:
+
+```
+# Iris's scanning has stopped (rescan-interval is 30m)
+time() - iris_last_scan_timestamp_seconds > 3600
+
+# The index is SHORT of what the scan actually saw on disk — the silent WatchService drop.
+# This is the runbook's manual "index count == mirror .md count" check, mechanized.
+iris_last_scan_notes_seen - iris_index_notes > 0
+
+# Never scanned (the gauges are absent, not zero, before the first scan completes)
+absent(iris_last_scan_timestamp_seconds)
+```
+
+**Do not alert on `iris_vault_newest_note_timestamp_seconds` alone.** It cannot distinguish a
+wedged sidecar from Calvin simply not having edited a note for a few days, so an alert on it pages
+on quiet weeks. It is published because it is a genuinely useful line on a dashboard next to the
+scan gauges, not because it answers the question the README wanted.
+
+**Still open:** a true sidecar-wedge detector needs the *sidecar* to report its own sync state
+(`ob sync-status --json` exists, so a sidecar-side exporter or a periodic status write the chart
+could scrape is the plausible shape). That is chart/sidecar territory, not iris-service's — flagged
+in `docs/relay-codex-chart-readme.md`.
 
 ## Beta-CLI risk register
 

@@ -2,11 +2,11 @@ package me.cference.iris
 
 import me.cference.iris.build.BuildInfo
 import me.cference.iris.config.AppConfig
-import me.cference.iris.http.{HealthRoutes, HttpServer, NoteRoutes, RequestTracing}
+import me.cference.iris.http.{HealthRoutes, HttpServer, MetricsRoutes, NoteRoutes, RequestTracing}
 import me.cference.iris.persistence.{Db, NoteRepository, SchemaMigrator}
-import me.cference.iris.scan.{IndexReconciler, VaultWatcher}
+import me.cference.iris.scan.{IndexReconciler, VaultQuiesce, VaultWatcher}
 import com.typesafe.config.ConfigFactory
-import org.apache.pekko.actor.typed.ActorSystem
+import org.apache.pekko.actor.typed.{ActorSystem, DispatcherSelector}
 import org.apache.pekko.actor.typed.scaladsl.Behaviors
 import org.apache.pekko.http.scaladsl.Http.ServerBinding
 import org.apache.pekko.http.scaladsl.server.Directives.*
@@ -14,7 +14,7 @@ import org.slf4j.LoggerFactory
 
 import java.nio.file.Files
 import java.util.concurrent.atomic.AtomicBoolean
-import scala.concurrent.Future
+import scala.concurrent.{ExecutionContext, Future}
 import scala.util.control.NonFatal
 import scala.util.{Failure, Success}
 
@@ -57,21 +57,29 @@ object Main:
       else hermes.VaultEventPublisher.NoOp
     val reconciler = IndexReconciler(cfg.vault.root, repo, publisher)
 
+    // Every blocking vault operation — the quiesce wait, the initial scan, rescans, on-demand
+    // reindexes — runs HERE, never on the default dispatcher the HTTP server shares. The quiesce
+    // gate alone can park a thread for 15 minutes; parking one of the default dispatcher's few
+    // threads for that long would starve request handling.
+    val vaultIo: ExecutionContext =
+      system.dispatchers.lookup(DispatcherSelector.fromConfig("iris.vault-io-dispatcher"))
+
     // Readiness flips UP once the server is bound; withdrawn first on shutdown. Queries serve the
     // PRIOR index while the initial scan runs — health does not wait on the vault.
     val readiness = new AtomicBoolean(false)
-    // Reindex requests run on the system EC; the reconciler serializes nothing yet because
-    // phase 1 has exactly one writer of the index (this process).
+    // The reconciler serializes nothing yet because phase 1 has exactly one writer of the index
+    // (this process); the dispatcher's small pool is what keeps concurrent scans bounded.
     val triggerReindex: () => Unit = () =>
       Future {
         try
           reconciler.fullScan()
           ()
         catch case NonFatal(e) => log.error(s"reindex failed: ${e.getMessage}", e)
-      }
+      }(vaultIo)
       ()
     val routes = RequestTracing.withCorrelationId(
       HealthRoutes(BuildInfo.version, () => readiness.get()) ~
+        MetricsRoutes(repo).routes ~
         NoteRoutes(repo, triggerReindex).routes
     )
 
@@ -85,10 +93,15 @@ object Main:
           Integer.valueOf(binding.localAddress.getPort),
           cfg.vault.root
         )
-        // Initial full scan in the background (blocking I/O off the request path); the watcher
-        // and the periodic rescan start once the initial pass has the index caught up.
+        // Initial full scan on the vault-io dispatcher (blocking, and the quiesce gate inside it
+        // can park for minutes); the watcher and the periodic rescan start once the initial pass
+        // has the index caught up.
         Future {
           try
+            // Wait out the sidecar's first download before scanning OR registering the watcher —
+            // both are unreliable against a tree still being written. First-boot only; the
+            // periodic rescan remains the net for later bulk landings.
+            if cfg.scan.quiesce.enabled then quiesceVault(cfg)
             val s = reconciler.fullScan()
             log.info(
               "index holds {} notes after initial scan",
@@ -98,7 +111,7 @@ object Main:
           catch
             case NonFatal(e) =>
               log.error(s"initial scan failed: ${e.getMessage}", e)
-        }.foreach { _ =>
+        }(vaultIo).foreach { _ =>
           if cfg.scan.watchEnabled then
             val watcher =
               VaultWatcher(cfg.vault.root, reconciler, cfg.scan.debounce, triggerReindex)
@@ -122,3 +135,21 @@ object Main:
         system.terminate()
         System.exit(1)
     }
+
+  /** Log whichever way the quiesce gate resolved; a timeout is a warning, never a failure. */
+  private def quiesceVault(cfg: AppConfig): Unit =
+    VaultQuiesce.awaitStable(cfg.vault.root, cfg.scan.quiesce) match
+      case VaultQuiesce.Outcome.Stable(fp, waited) =>
+        log.info(
+          "vault mirror settled after {}s: {} notes on disk — starting initial scan",
+          java.lang.Long.valueOf(waited.toSeconds),
+          Integer.valueOf(fp.fileCount)
+        )
+      case VaultQuiesce.Outcome.TimedOut(fp, waited) =>
+        log.warn(
+          "vault mirror still changing after {}s ({} notes on disk) — scanning anyway; the {} "
+            + "rescan heals a short index",
+          java.lang.Long.valueOf(waited.toSeconds),
+          Integer.valueOf(fp.fileCount),
+          cfg.scan.rescanInterval
+        )

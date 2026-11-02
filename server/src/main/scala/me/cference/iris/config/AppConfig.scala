@@ -24,11 +24,23 @@ final case class DbConfig(
     migrateMaxWait: FiniteDuration
 )
 
+/**
+ * How long boot waits for the vault mirror to stop growing before the initial scan. Guards the
+ * first-boot watcher race (see [[me.cference.iris.scan.VaultQuiesce]]).
+ */
+final case class QuiesceConfig(
+    enabled: Boolean,
+    pollInterval: FiniteDuration,
+    stableSamples: Int,
+    maxWait: FiniteDuration
+)
+
 /** Watch/rescan cadence. */
 final case class ScanConfig(
     watchEnabled: Boolean,
     debounce: FiniteDuration,
-    rescanInterval: FiniteDuration
+    rescanInterval: FiniteDuration,
+    quiesce: QuiesceConfig
 )
 
 /** The change-feed switch (real publishing waits on the lexicon contract + topics). */
@@ -63,7 +75,13 @@ object AppConfig:
       ScanConfig(
         watchEnabled = scan.getBoolean("watch-enabled"),
         debounce = scan.getDuration("debounce").toMillis.millis,
-        rescanInterval = scan.getDuration("rescan-interval").toMillis.millis
+        rescanInterval = scan.getDuration("rescan-interval").toMillis.millis,
+        quiesce = QuiesceConfig(
+          enabled = scan.getBoolean("quiesce.enabled"),
+          pollInterval = scan.getDuration("quiesce.poll-interval").toMillis.millis,
+          stableSamples = scan.getInt("quiesce.stable-samples"),
+          maxWait = scan.getDuration("quiesce.max-wait").toMillis.millis
+        )
       ),
       HermesConfig(enabled = raw.getBoolean("iris.hermes.enabled"))
     )
