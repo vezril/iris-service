@@ -34,6 +34,19 @@ radius is that service's own derived data, which it can rebuild.
 
 ## Enforcement requirements (phase 2)
 
+> **Implementation status (2026-11-02).** The gate itself is built and tested in
+> `core/src/main/scala/me/cference/iris/write/` — `WriteScope`, `ConfinedPath`, `ServiceRegistry`
+> — with 30 specs written as escape attempts (`core/src/test/.../write/`). **Properties 1, 3, 4
+> and 5 are implemented and enforced. Property 2 (symlink resolution) is NOT**: it needs the
+> filesystem, which `core/` does not touch, so it is the writer's obligation and lands with the
+> write path. **No write path exists yet**, so nothing can escape anything today.
+>
+> Property 5 is enforced *by the type system*, not by review: `ConfinedPath`'s constructor is
+> private and `confine` is the only way to obtain one, so a writer taking a `ConfinedPath` cannot
+> be called with an unchecked path — and Scala 3 gives `copy` the constructor's visibility, so a
+> legitimate instance cannot be re-pointed at another file afterwards. Both holes are closed by
+> `assertDoesNotCompile` assertions that fail the build if a future change reopens them.
+
 Non-negotiable properties, each of which must **fail closed**:
 
 1. **Canonical-path check.** Enforce on the NFC-normalized, `..`-rejected `VaultPath` — the same
