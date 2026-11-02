@@ -67,6 +67,13 @@ Local run against the real vault is safe — phase 1 never opens a file for writ
 IRIS_VAULT_ROOT=$HOME/Mindmap sbt server/run
 ```
 
+> **Picking this up on a machine with a container runtime? Read
+> `docs/handoff-homelab-verification.md` first.** Three test suites (testcontainers + Postgres) and
+> every end-to-end run were authored on a machine with no Docker/podman, so they have only ever
+> executed in CI — and the quiesce gate's timings were reasoned, never measured. That doc is the
+> list of what to run and what to conclude, including a staged-fill test that reproduces the
+> first-boot race without needing the cluster.
+
 **Vault access (decided 2026-08-26, supersedes the deferred V1/V2 fork):** the official
 **headless Obsidian Sync CLI** (`obsidian-headless`, open beta) runs as a sidecar container in
 the iris pod, pulling the vault into a shared PVC in **download-only `mirror-remote` mode**
