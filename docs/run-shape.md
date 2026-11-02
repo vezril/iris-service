@@ -27,8 +27,8 @@ iris pod
 ```
 
 - **PVC `iris-vault`, ~5Gi, local-filesystem storage class (local-path) — NOT NFS.** The watcher
-  uses inotify, which does not fire on NFS; on NFS Iris degrades to its 6h rescans. The vault is
-  ~6k markdown notes + assets (~a few hundred MB today).
+  uses inotify, which does not fire on NFS; on NFS Iris degrades to its periodic rescan (default
+  **30m**, see below). The vault is ~6k markdown notes + assets (~a few hundred MB today).
 - **PVC layout:** `vault/` (the Mindmap mirror — disposable: a fresh sync rebuilds it, the
   Postgres index rebuilds from it) and `ob-state/` (the CLI's HOME: login session + sync state —
   this must survive restarts).
@@ -131,6 +131,32 @@ Two consequences:
 `sync/<vault>/config.json` *inside that same config dir*, i.e. on the PVC we call disposable. Wipe
 the PVC, re-run setup without `--mode`, and you silently get `bidirectional`. The predicted
 failure mode has a file path.
+
+## The WatchService bulk-creation race (known; two mitigations, one standing)
+
+`WatchService` has an **inherent directory-registration race**: when many files land at once it can
+**silently drop events** — no error, no `OVERFLOW`. The index goes short with no symptom, and a
+missing note is invisible to consumers (Mnemosyne would simply never see it). Observed on first
+deploy: the initial scan saw **63 of 5,917** notes; 31 were missed outright.
+
+Two mitigations, and they are not interchangeable:
+
+1. **Quiesce gate (`iris.scan.quiesce`, default on) — closes the FIRST-BOOT instance only.** Boot
+   holds the initial scan until a stat-only fingerprint of the mirror (file count, total bytes,
+   newest mtime) is unchanged for 3 consecutive 5s polls, capped at 15m. Both the scan *and* the
+   watcher's directory registration then run against a settled tree. An empty tree never counts as
+   settled — that is the first-boot failure itself — and it logs a warning on every poll, so a
+   sidecar that landed nothing is loud rather than a silent 15-minute wait. **Fails open:** at
+   `max-wait` it scans anyway, because serving an empty index is a wrong-but-plausible answer.
+   Readiness never waits on this; queries serve the prior index throughout.
+2. **Periodic rescan (`iris.scan.rescan-interval`, default `30m`) — the STANDING net for the
+   general case.** The gate does nothing for a *later* bulk landing: a Sync backlog after downtime,
+   a vault restructure, a **PVC/mirror rebuild** (a *designed* path — the mirror is disposable), any
+   bulk import. The rescan is the only thing that heals those. Its cost is ~nil (stat-per-file walk,
+   ~0.5s for the full vault, hashing skipped for unchanged files). **Do not relax past `1h`.**
+
+`POST /admin/reindex` forces a full reconcile on demand (it healed the first-boot 31 exactly).
+After any bulk event, verify `postgres index count == mirror .md count` and reindex if short.
 
 ## Resource asks
 
