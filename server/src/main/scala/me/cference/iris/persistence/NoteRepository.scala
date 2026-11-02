@@ -36,7 +36,7 @@ final case class ScanSummary(
  * without `.md`), else a unique case-insensitive basename match, else unresolved (`NULL` — data,
  * not an error). Upserting or deleting a note re-resolves the links that could point at it.
  */
-final class NoteRepository(ds: DataSource) extends NoteQueries:
+final class NoteRepository(ds: DataSource) extends NoteQueries with IndexMetricsSource:
 
   /** All indexed note metadata, for the scanner's cheap change comparison. */
   def allMeta(): Map[String, IndexedMeta] =
@@ -93,15 +93,64 @@ final class NoteRepository(ds: DataSource) extends NoteQueries:
     }
 
   /** Count of indexed notes (health/verification surface). */
-  def noteCount(): Long =
+  def noteCount(): Long = withConnection(countNotes)
+
+  /** The whole metrics surface on one connection. */
+  override def indexMetrics(): IndexMetrics =
     withConnection { conn =>
-      val stmt = conn.prepareStatement("SELECT count(*) FROM notes")
-      try
-        val rs = stmt.executeQuery()
-        rs.next()
-        rs.getLong(1)
-      finally stmt.close()
+      IndexMetrics(
+        indexedNotes = countNotes(conn),
+        newestNoteModifiedAt = newestNoteMtime(conn),
+        lastScan = lastCompletedScan(conn)
+      )
     }
+
+  private def countNotes(conn: Connection): Long =
+    val stmt = conn.prepareStatement("SELECT count(*) FROM notes")
+    try
+      val rs = stmt.executeQuery()
+      rs.next()
+      rs.getLong(1)
+    finally stmt.close()
+
+  private def newestNoteMtime(conn: Connection): Option[Instant] =
+    val stmt = conn.prepareStatement("SELECT max(modified_at) FROM notes")
+    try
+      val rs = stmt.executeQuery()
+      rs.next()
+      Option(rs.getTimestamp(1)).map(_.toInstant)
+    finally stmt.close()
+
+  /**
+   * Only COMPLETED scans count: an in-flight row has a NULL `finished_at`, and reporting a scan as
+   * done while it is still walking would make the liveness gauge lie in the one direction that
+   * matters. None before the first scan finishes — the caller omits the metric rather than
+   * publishing a zero timestamp, which would read as decades of staleness.
+   */
+  private def lastCompletedScan(conn: Connection): Option[LastScan] =
+    val stmt = conn.prepareStatement(
+      """SELECT kind, finished_at, notes_seen, created, changed, deleted, errors
+        |  FROM scans
+        | WHERE finished_at IS NOT NULL
+        | ORDER BY finished_at DESC, id DESC
+        | LIMIT 1""".stripMargin
+    )
+    try
+      val rs = stmt.executeQuery()
+      if !rs.next() then None
+      else
+        Some(
+          LastScan(
+            kind = rs.getString(1),
+            finishedAt = rs.getTimestamp(2).toInstant,
+            notesSeen = rs.getInt(3),
+            created = rs.getInt(4),
+            changed = rs.getInt(5),
+            deleted = rs.getInt(6),
+            errors = rs.getInt(7)
+          )
+        )
+    finally stmt.close()
 
   // --- read surface (NoteQueries) -----------------------------------------------
 

@@ -127,4 +127,72 @@ class NoteRepositorySpec extends AnyWordSpec with Matchers with TestContainerFor
         repo.recordScan(ScanSummary("full", now, now.plusSeconds(3), 1, 1, 0, 0, 0))
       }
     }
+
+    "report empty metrics on a fresh index, with no scan row to speak of" in withContainers { c =>
+      withRepo(c) { (repo, _) =>
+        val m = repo.indexMetrics()
+        m.indexedNotes shouldBe 0L
+        // Both absent rather than zero: the route omits the gauges entirely, so Prometheus sees
+        // absent() instead of a 1970 timestamp that would read as decades of staleness.
+        m.newestNoteModifiedAt shouldBe None
+        m.lastScan shouldBe None
+      }
+    }
+
+    "report the newest note mtime and the LAST COMPLETED scan" in withContainers { c =>
+      withRepo(c) { (repo, _) =>
+        repo.upsert(note("old.md", "older"))
+        val newer = me.cference.iris.parse.NoteParser.parse(
+          VaultPath.parse("new.md").toOption.get,
+          "newer".getBytes(StandardCharsets.UTF_8),
+          now.plusSeconds(3600)
+        )
+        repo.upsert(newer)
+
+        repo.recordScan(ScanSummary("full", now, now.plusSeconds(1), 2, 2, 0, 0, 0))
+        repo.recordScan(ScanSummary("watch", now, now.plusSeconds(90), 2, 0, 1, 0, 4))
+
+        val m = repo.indexMetrics()
+        m.indexedNotes shouldBe 2L
+        m.newestNoteModifiedAt shouldBe Some(now.plusSeconds(3600))
+        // The later finished_at wins, not insertion order and not the 'full' kind.
+        m.lastScan.map(_.kind) shouldBe Some("watch")
+        m.lastScan.map(_.finishedAt) shouldBe Some(now.plusSeconds(90))
+        m.lastScan.map(_.changed) shouldBe Some(1)
+        m.lastScan.map(_.errors) shouldBe Some(4)
+      }
+    }
+
+    "ignore an in-flight scan so the liveness gauge cannot report a scan that is still walking" in
+      withContainers { c =>
+        withRepo(c) { (repo, ds) =>
+          repo.recordScan(ScanSummary("full", now, now.plusSeconds(5), 1, 1, 0, 0, 0))
+          // A row with NULL finished_at: started later, not done. recordScan only writes finished
+          // scans, so insert directly — this is the shape IndexReconciler would leave on a crash.
+          val conn = ds.getConnection
+          try
+            val ps = conn.prepareStatement(
+              "INSERT INTO scans (kind, started_at, finished_at) VALUES ('full', ?, NULL)"
+            )
+            ps.setTimestamp(1, java.sql.Timestamp.from(now.plusSeconds(600)))
+            ps.executeUpdate()
+          finally conn.close()
+
+          repo.indexMetrics().lastScan.map(_.finishedAt) shouldBe Some(now.plusSeconds(5))
+        }
+      }
+
+    "surface a short index as a gap between notes_seen and indexedNotes" in withContainers { c =>
+      withRepo(c) { (repo, _) =>
+        // The silent WatchService drop, as the metrics see it: the scan walked 5,917 files but
+        // only 1 reached the index. Hera subtracts the two gauges to detect exactly this.
+        repo.upsert(note("only.md", "the one that landed"))
+        repo.recordScan(ScanSummary("full", now, now.plusSeconds(2), 5917, 1, 0, 0, 0))
+
+        val m = repo.indexMetrics()
+        m.lastScan.map(_.notesSeen) shouldBe Some(5917)
+        m.indexedNotes shouldBe 1L
+        m.lastScan.map(_.notesSeen.toLong - m.indexedNotes) shouldBe Some(5916L)
+      }
+    }
   }
