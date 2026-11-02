@@ -58,9 +58,45 @@ the same race, and the periodic rescan remains the only thing that heals those.
    A pod that looks idle at boot with `/health` UP and a near-zero index count is the gate working,
    not a hang. `POST /admin/reindex` is still the manual lever.
 
-## Unrelated, same session
+## `vault_freshness` — now implemented, but NOT as the README describes it
 
-`vault_freshness` — the gauge `charts/iris/README.md` promises Hera for catching a wedged-but-alive
-sidecar — is **still unimplemented**. There is no metrics surface in iris-service at all. The README
-says "Iris will expose" it, which is accurate as intent; just don't let Hera alerting get built
-against it yet.
+`charts/iris/README.md` says a wedged-but-alive sidecar "shows up as staleness, not a crash" and
+that "Iris will expose a `vault_freshness` gauge for **Hera** to alert on."
+
+iris-service now serves `GET /metrics` on :8080 (Prometheus text exposition, content-free). But
+**the gauge as described cannot be built honestly from inside Iris**, and shipping it under that
+name would have handed Hera a false authority:
+
+- Iris cannot see the sidecar's sync state. It lives in the CLI's own config dir, and depending on
+  a beta tool's internal state format is not a contract worth having.
+- The nearest thing Iris *can* measure — the newest note mtime — **cannot distinguish a wedged
+  sidecar from Calvin not having edited a note for three days.** An alert on it pages on quiet
+  weeks. It ships as `iris_vault_newest_note_timestamp_seconds`, explicitly labeled weak, for
+  dashboards only.
+
+So it is decomposed into signals that are actually sound:
+
+| Gauge | Strength | Use |
+|---|---|---|
+| `iris_last_scan_timestamp_seconds` | **Strong** | Stops advancing iff *Iris's own* scanning stopped |
+| `iris_last_scan_notes_seen` + `iris_index_notes` | **Strong** | Their difference is the short-index detector |
+| `iris_last_scan_errors` | Strong | Persistent non-zero ⇒ notes missing from the index |
+| `iris_vault_newest_note_timestamp_seconds` | **WEAK** | Dashboard only — do not alert |
+| `iris_index_queryable` | Strong | 0 ⇒ Iris is up but cannot reach Postgres |
+
+**The useful one is the second row.** The README's own manual instruction — *"verify `postgres index
+count == mirror .md count` after any bulk event"* — becomes
+`iris_last_scan_notes_seen - iris_index_notes > 0`. The silent `WatchService` drop that this whole
+thread is about is now mechanically detectable instead of needing someone to remember to check.
+
+Alert expressions are in `docs/run-shape.md` under "What the gauges can and cannot tell Hera".
+
+### Two asks on this
+
+4. **Re-point the README's observability line** at the decomposed gauges, and drop the
+   `vault_freshness` name — there is no metric by that name and there should not be, since the
+   thing it names is the one measurement Iris can't make.
+5. **A real sidecar-wedge detector is chart/sidecar territory.** `ob sync-status --json` exists, so
+   a sidecar-side exporter — or a periodic status write to the PVC that something scrapes — is the
+   plausible shape. Iris can't reach it; whoever owns the sidecar container can. Worth raising with
+   Calvin before anyone builds it, since it's net-new scope rather than a fix.

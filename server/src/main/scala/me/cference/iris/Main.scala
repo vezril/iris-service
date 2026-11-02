@@ -2,7 +2,7 @@ package me.cference.iris
 
 import me.cference.iris.build.BuildInfo
 import me.cference.iris.config.AppConfig
-import me.cference.iris.http.{HealthRoutes, HttpServer, NoteRoutes, RequestTracing}
+import me.cference.iris.http.{HealthRoutes, HttpServer, MetricsRoutes, NoteRoutes, RequestTracing}
 import me.cference.iris.persistence.{Db, NoteRepository, SchemaMigrator}
 import me.cference.iris.scan.{IndexReconciler, VaultQuiesce, VaultWatcher}
 import com.typesafe.config.ConfigFactory
@@ -79,6 +79,7 @@ object Main:
       ()
     val routes = RequestTracing.withCorrelationId(
       HealthRoutes(BuildInfo.version, () => readiness.get()) ~
+        MetricsRoutes(repo).routes ~
         NoteRoutes(repo, triggerReindex).routes
     )
 
