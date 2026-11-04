@@ -1,15 +1,26 @@
 package me.cference.iris
 
+import apollostorage.grpc.ObjectApiClient
 import me.cference.iris.build.BuildInfo
 import me.cference.iris.config.AppConfig
-import me.cference.iris.http.{HealthRoutes, HttpServer, MetricsRoutes, NoteRoutes, RequestTracing}
+import me.cference.iris.http.{
+  HealthRoutes,
+  HttpServer,
+  MetricsRoutes,
+  NoteWriteRoutes,
+  NoteRoutes,
+  RequestTracing
+}
 import me.cference.iris.persistence.{Db, NoteRepository, SchemaMigrator}
 import me.cference.iris.scan.{IndexReconciler, VaultQuiesce, VaultWatcher}
+import me.cference.iris.write.{ApolloSnapshotStore, ServiceRegistry, SnapshotStore, VaultWriter}
 import com.typesafe.config.ConfigFactory
 import org.apache.pekko.actor.typed.{ActorSystem, DispatcherSelector}
+import org.apache.pekko.grpc.GrpcClientSettings
 import org.apache.pekko.actor.typed.scaladsl.Behaviors
 import org.apache.pekko.http.scaladsl.Http.ServerBinding
 import org.apache.pekko.http.scaladsl.server.Directives.*
+import org.apache.pekko.http.scaladsl.server.Route
 import org.slf4j.LoggerFactory
 
 import java.nio.file.Files
@@ -77,9 +88,34 @@ object Main:
         catch case NonFatal(e) => log.error(s"reindex failed: ${e.getMessage}", e)
       }(vaultIo)
       ()
+    // Phase-2 writes. When disabled (the default) the PATCH route is not mounted at all, so there
+    // is no write surface to misconfigure — stronger than a mounted route behind a flag.
+    val writeRoutes: Option[Route] =
+      if !cfg.write.enabled then
+        log.info("vault writes DISABLED (iris.write.enabled=false) — read-only")
+        None
+      else
+        ServiceRegistry.build(cfg.write.tokens) match
+          case Left(err) =>
+            // A token map that cannot be built would let a service write to the wrong folder.
+            // There is no safe degraded mode for that, so it is a boot failure.
+            log.error("boot aborted: write tokens are invalid — {}", err.message)
+            System.exit(1)
+            None
+          case Right(registry) =>
+            val snapshots = buildSnapshotStore(cfg)
+            log.warn(
+              "vault writes ENABLED for {} service(s): {} — snapshots to apollo bucket '{}'",
+              Integer.valueOf(registry.size),
+              registry.services.mkString(", "),
+              cfg.write.apolloBucket
+            )
+            Some(NoteWriteRoutes(registry, VaultWriter(cfg.vault.root, snapshots)).routes)
+
     val routes = RequestTracing.withCorrelationId(
       HealthRoutes(BuildInfo.version, () => readiness.get()) ~
         MetricsRoutes(repo).routes ~
+        writeRoutes.getOrElse(reject) ~
         NoteRoutes(repo, triggerReindex).routes
     )
 
@@ -135,6 +171,33 @@ object Main:
         system.terminate()
         System.exit(1)
     }
+
+  /**
+   * The Apollo snapshot store, plus its bucket. A failure to reach Apollo at boot is logged and the
+   * store is kept: every write then refuses with `Unavailable`, which is the fail-closed posture.
+   * Crashing instead would take down the read API over a write-only dependency.
+   */
+  private def buildSnapshotStore(cfg: AppConfig)(using
+      system: ActorSystem[Nothing]
+  ): SnapshotStore =
+    val settings = GrpcClientSettings
+      .connectToServiceAt(cfg.write.apolloHost, cfg.write.apolloPort)
+      .withTls(false) // h2c; TLS is Apollo-side configuration, off by default in the cluster
+    val store =
+      ApolloSnapshotStore(
+        ObjectApiClient(settings),
+        cfg.write.apolloBucket,
+        cfg.write.apolloTimeout
+      )
+    store.ensureBucket() match
+      case Right(()) => ()
+      case Left(err) =>
+        log.error(
+          "apollo snapshot bucket '{}' is NOT ready ({}) — writes will refuse until it is",
+          cfg.write.apolloBucket,
+          err.message
+        )
+    store
 
   /** Log whichever way the quiesce gate resolved; a timeout is a warning, never a failure. */
   private def quiesceVault(cfg: AppConfig): Unit =

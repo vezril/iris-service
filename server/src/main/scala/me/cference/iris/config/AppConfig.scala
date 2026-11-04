@@ -43,6 +43,25 @@ final case class ScanConfig(
     quiesce: QuiesceConfig
 )
 
+/**
+ * The phase-2 write surface. `enabled` defaults to FALSE and gates whether the PATCH route is
+ * MOUNTED AT ALL — a route that does not exist is a stronger guarantee than one that checks a flag.
+ *
+ * @param tokens
+ *   service -> write token, from a k8s Secret via `IRIS_WRITE_TOKENS` (`Svc=tok,Svc2=tok2`). Never
+ *   in config files. An empty map authenticates nobody, so every write refuses.
+ * @param apolloBucket
+ *   where pre-write snapshots land. Must be lowercase (Apollo's BucketName rule).
+ */
+final case class WriteConfig(
+    enabled: Boolean,
+    tokens: Map[String, String],
+    apolloHost: String,
+    apolloPort: Int,
+    apolloBucket: String,
+    apolloTimeout: FiniteDuration
+)
+
 /** The change-feed switch (real publishing waits on the lexicon contract + topics). */
 final case class HermesConfig(enabled: Boolean)
 
@@ -51,7 +70,8 @@ final case class AppConfig(
     vault: VaultConfig,
     db: DbConfig,
     scan: ScanConfig,
-    hermes: HermesConfig
+    hermes: HermesConfig,
+    write: WriteConfig
 )
 
 object AppConfig:
@@ -83,5 +103,36 @@ object AppConfig:
           maxWait = scan.getDuration("quiesce.max-wait").toMillis.millis
         )
       ),
-      HermesConfig(enabled = raw.getBoolean("iris.hermes.enabled"))
+      HermesConfig(enabled = raw.getBoolean("iris.hermes.enabled")), {
+        val w = raw.getConfig("iris.write")
+        WriteConfig(
+          enabled = w.getBoolean("enabled"),
+          tokens = parseTokens(w.getString("tokens")),
+          apolloHost = w.getString("apollo.host"),
+          apolloPort = w.getInt("apollo.port"),
+          apolloBucket = w.getString("apollo.bucket"),
+          apolloTimeout = w.getDuration("apollo.timeout").toMillis.millis
+        )
+      }
     )
+
+  /**
+   * Parse `Svc=token,Svc2=token2`.
+   *
+   * Entries that do not split cleanly on a single `=` are DROPPED rather than guessed at, and a
+   * dropped entry means that service cannot write — the fail-closed direction. A malformed map
+   * never widens access; at worst it narrows it to nothing.
+   */
+  private[config] def parseTokens(raw: String): Map[String, String] =
+    raw
+      .split(',')
+      .iterator
+      .map(_.trim)
+      .filter(_.nonEmpty)
+      .flatMap { entry =>
+        entry.split('=') match
+          case Array(service, token) if service.trim.nonEmpty && token.trim.nonEmpty =>
+            Some(service.trim -> token.trim)
+          case _ => None
+      }
+      .toMap
