@@ -1,6 +1,7 @@
 package me.cference.iris.write
 
 import apollostorage.grpc.*
+import com.google.protobuf.ByteString as ProtoBytes
 import io.grpc.{Status, StatusRuntimeException}
 import me.cference.iris.domain.{ContentHash, VaultPath}
 import org.apache.pekko.actor.testkit.typed.scaladsl.ActorTestKit
@@ -66,6 +67,7 @@ class ApolloSnapshotStoreSpec extends AnyWordSpec with Matchers with BeforeAndAf
             val bytes = body.flatten.toArray
             headers = headers ++ hdr.toVector
             received = bytes.toVector
+            hdr.foreach(h => stored = stored.updated(h.`object`, bytes))
 
             // Apollo verifies only when BOTH are present (verified from source).
             hdr.foreach { h =>
@@ -91,13 +93,48 @@ class ApolloSnapshotStoreSpec extends AnyWordSpec with Matchers with BeforeAndAf
           bucketsCreated = bucketsCreated :+ r.bucket
           Future.successful(BucketResponse(bucket = r.bucket))
 
+    /** Keyed store the read side is served from, so list/fetch see what put actually wrote. */
+    var stored: Map[String, Array[Byte]] = Map.empty
+    var listPageSizes: Vector[Int] = Vector.empty
+
+    def listObjects(r: ListObjectsRequest): Future[ListObjectsResponse] =
+      listPageSizes = listPageSizes :+ r.pageSize
+      failWith match
+        case Some(t) => Future.failed(t)
+        case None =>
+          val hits = stored.toVector
+            .filter(_._1.startsWith(r.prefix))
+            .zipWithIndex
+            .map { case ((k, b), i) =>
+              ObjectEntry(`object` = k, generation = (i + 1).toLong, size = b.length.toLong)
+            }
+          Future.successful(ListObjectsResponse(objects = hits))
+
+    def getObject(r: GetObjectRequest): Source[GetObjectResponse, NotUsed] =
+      failWith match
+        case Some(t) => Source.failed(t).mapMaterializedValue(_ => NotUsed)
+        case None =>
+          stored.get(r.`object`) match
+            case None =>
+              Source
+                .failed(new StatusRuntimeException(Status.NOT_FOUND))
+                .mapMaterializedValue(_ => NotUsed)
+            case Some(b) =>
+              Source.single(
+                GetObjectResponse(
+                  GetObjectResponse.Payload.Header(
+                    ObjectMetadata(bucket = r.bucket, `object` = r.`object`, size = b.length.toLong)
+                  )
+                )
+              ) ++ Source.single(
+                GetObjectResponse(GetObjectResponse.Payload.Chunk(ProtoBytes.copyFrom(b)))
+              )
+
     // Unused by the snapshot path.
     def deleteBucket(r: DeleteBucketRequest) = Future.failed(new UnsupportedOperationException)
-    def getObject(r: GetObjectRequest) = Source.empty
     def headObject(r: HeadObjectRequest) = Future.failed(new UnsupportedOperationException)
     def deleteObject(r: DeleteObjectRequest) = Future.failed(new UnsupportedOperationException)
     def listBuckets(r: ListBucketsRequest) = Future.failed(new UnsupportedOperationException)
-    def listObjects(r: ListObjectsRequest) = Future.failed(new UnsupportedOperationException)
 
   private def store(api: ObjectApi) = ApolloSnapshotStore(api, "iris", 5.seconds)
 
@@ -246,5 +283,77 @@ class ApolloSnapshotStoreSpec extends AnyWordSpec with Matchers with BeforeAndAf
           .walk(dir)
           .sorted(java.util.Comparator.reverseOrder())
           .forEach(p => java.nio.file.Files.deleteIfExists(p))
+    }
+  }
+
+  "The archive" should {
+
+    "round-trip: a snapshot taken is a snapshot listed and fetched" in {
+      // The property that makes the undo button real rather than claimed.
+      val api = FakeApi()
+      val store = ApolloSnapshotStore(api, "iris", 5.seconds)
+      store.snapshot(path, payload).isRight shouldBe true
+
+      val listed = store.list(path, 50)
+      listed.map(_.map(_.sha256)) shouldBe Right(Vector(ContentHash.ofBytes(payload)))
+
+      store.fetch(path, ContentHash.ofBytes(payload)).map(_.toVector) shouldBe
+        Right(payload.toVector)
+    }
+
+    "list only the asked-for note, not another note's snapshots" in {
+      val api = FakeApi()
+      val store = ApolloSnapshotStore(api, "iris", 5.seconds)
+      val other = VaultPath.parse("Atlas/Olympus/Mnemosyne/other.md").toOption.get
+      store.snapshot(path, payload)
+      store.snapshot(other, "different".getBytes(StandardCharsets.UTF_8))
+
+      store.list(path, 50).map(_.size) shouldBe Right(1)
+      store.list(other, 50).map(_.size) shouldBe Right(1)
+    }
+
+    "pass the limit through as the page size" in {
+      val api = FakeApi()
+      ApolloSnapshotStore(api, "iris", 5.seconds).list(path, 7)
+      api.listPageSizes shouldBe Vector(7)
+    }
+
+    "report an absent snapshot as NotFound, NOT as an outage" in {
+      // On a GET, Apollo's NOT_FOUND means the object is missing. On a PUT the same code means the
+      // bucket is gone. Collapsing them would report a missing snapshot as Apollo being down.
+      val api = FakeApi()
+      val store = ApolloSnapshotStore(api, "iris", 5.seconds)
+      store.fetch(path, ContentHash.ofBytes("never stored".getBytes(StandardCharsets.UTF_8))) match
+        case Left(SnapshotError.NotFound(_)) => succeed
+        case other => fail(s"expected NotFound, got $other")
+    }
+
+    "REFUSE bytes that do not hash to the name they are filed under" in {
+      // Corruption in the archive. Returning these as a restore candidate would be worse than
+      // reporting that there is nothing to restore.
+      val api = FakeApi()
+      val store = ApolloSnapshotStore(api, "iris", 5.seconds)
+      store.snapshot(path, payload)
+      val sha = ContentHash.ofBytes(payload)
+      // Tamper with the stored bytes behind the store's back.
+      api.stored = api.stored.updated(
+        s"notes/${path.value}/${sha.value}",
+        "tampered".getBytes(StandardCharsets.UTF_8)
+      )
+      store.fetch(path, sha) match
+        case Left(SnapshotError.Rejected(detail)) => detail should include("hashes to")
+        case other => fail(s"expected Rejected, got $other")
+    }
+
+    "classify an unreachable archive as Unavailable on both list and fetch" in {
+      val api = FakeApi(failWith =
+        Some(new StatusRuntimeException(Status.UNAVAILABLE.withDescription("refused")))
+      )
+      val store = ApolloSnapshotStore(api, "iris", 5.seconds)
+      store.list(path, 10).left.map(_.getClass.getSimpleName) shouldBe Left("Unavailable")
+      store
+        .fetch(path, ContentHash.ofBytes(payload))
+        .left
+        .map(_.getClass.getSimpleName) shouldBe Left("Unavailable")
     }
   }

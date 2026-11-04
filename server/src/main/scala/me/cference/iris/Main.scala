@@ -9,7 +9,8 @@ import me.cference.iris.http.{
   MetricsRoutes,
   NoteWriteRoutes,
   NoteRoutes,
-  RequestTracing
+  RequestTracing,
+  SnapshotRoutes
 }
 import me.cference.iris.persistence.{Db, NoteRepository, SchemaMigrator}
 import me.cference.iris.scan.{IndexReconciler, VaultQuiesce, VaultWatcher}
@@ -88,6 +89,12 @@ object Main:
         catch case NonFatal(e) => log.error(s"reindex failed: ${e.getMessage}", e)
       }(vaultIo)
       ()
+    // One store, two consumers: the writer takes snapshots, the archive reads them back.
+    val snapshotStore: Option[ApolloSnapshotStore] = buildSnapshotStore(cfg)
+
+    /** Reading the undo history. Available whenever Apollo is, independent of writes. */
+    val snapshotRoutes: Option[Route] = snapshotStore.map(SnapshotRoutes(_).routes)
+
     // Phase-2 writes. When disabled (the default) the PATCH route is not mounted at all, so there
     // is no write surface to misconfigure — stronger than a mounted route behind a flag.
     val writeRoutes: Option[Route] =
@@ -103,7 +110,8 @@ object Main:
             System.exit(1)
             None
           case Right(registry) =>
-            val snapshots = buildSnapshotStore(cfg)
+            // No Apollo means no undo, so every write refuses rather than proceeding unprotected.
+            val snapshots: SnapshotStore = snapshotStore.getOrElse(SnapshotStore.unconfigured)
             log.warn(
               "vault writes ENABLED for {} service(s): {} — snapshots to apollo bucket '{}'",
               Integer.valueOf(registry.size),
@@ -116,6 +124,9 @@ object Main:
       HealthRoutes(BuildInfo.version, () => readiness.get()) ~
         MetricsRoutes(repo).routes ~
         writeRoutes.getOrElse(reject) ~
+        // Before NoteRoutes: its extractUnmatchedPath would otherwise read '/notes/x/snapshots'
+        // as a note named 'x/snapshots' and answer 404.
+        snapshotRoutes.getOrElse(reject) ~
         NoteRoutes(repo, triggerReindex).routes
     )
 
@@ -177,27 +188,43 @@ object Main:
    * store is kept: every write then refuses with `Unavailable`, which is the fail-closed posture.
    * Crashing instead would take down the read API over a write-only dependency.
    */
+  /**
+   * The Apollo snapshot store, when `iris.write.apollo.host` is set.
+   *
+   * Built from the HOST being configured, deliberately NOT from `write.enabled`. The archive is
+   * read-only and is most wanted precisely when writes have just been turned OFF — after an
+   * incident, when someone needs to see what the undo history holds. Tying it to the write flag
+   * would remove the recovery view at the moment it matters.
+   *
+   * A failure to reach Apollo at boot is logged, not fatal: writes then refuse with `Unavailable`
+   * (fail closed) and the read API keeps serving. Crashing would take the whole service down over a
+   * dependency phase 1 does not use.
+   */
   private def buildSnapshotStore(cfg: AppConfig)(using
       system: ActorSystem[Nothing]
-  ): SnapshotStore =
-    val settings = GrpcClientSettings
-      .connectToServiceAt(cfg.write.apolloHost, cfg.write.apolloPort)
-      .withTls(false) // h2c; TLS is Apollo-side configuration, off by default in the cluster
-    val store =
-      ApolloSnapshotStore(
-        ObjectApiClient(settings),
-        cfg.write.apolloBucket,
-        cfg.write.apolloTimeout
-      )
-    store.ensureBucket() match
-      case Right(()) => ()
-      case Left(err) =>
-        log.error(
-          "apollo snapshot bucket '{}' is NOT ready ({}) — writes will refuse until it is",
+  ): Option[ApolloSnapshotStore] =
+    if cfg.write.apolloHost.isEmpty then
+      log.info("apollo not configured (iris.write.apollo.host empty) — no snapshots, no archive")
+      None
+    else
+      val settings = GrpcClientSettings
+        .connectToServiceAt(cfg.write.apolloHost, cfg.write.apolloPort)
+        .withTls(false) // h2c; TLS is Apollo-side configuration, off by default in the cluster
+      val store =
+        ApolloSnapshotStore(
+          ObjectApiClient(settings),
           cfg.write.apolloBucket,
-          err.message
+          cfg.write.apolloTimeout
         )
-    store
+      store.ensureBucket() match
+        case Right(()) => ()
+        case Left(err) =>
+          log.error(
+            "apollo snapshot bucket '{}' is NOT ready ({}) — writes will refuse until it is",
+            cfg.write.apolloBucket,
+            err.message
+          )
+      Some(store)
 
   /** Log whichever way the quiesce gate resolved; a timeout is a warning, never a failure. */
   private def quiesceVault(cfg: AppConfig): Unit =
