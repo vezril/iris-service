@@ -16,9 +16,20 @@ concurrency:
 
 permissions:
   contents: read
+  # Required to resolve the `io.codex` Lexicon contract jars from GitHub Packages (see
+  # build.sbt). Without this, sbt fails at DEPENDENCY RESOLUTION, not at compile — so the
+  # error looks nothing like a code problem. No stored secret: Actions provides
+  # GITHUB_ACTOR + GITHUB_TOKEN automatically.
+  packages: read
 
 env:
   IMAGE_NAME: iris
+  # sbt reads this for the GitHub Packages credential (see build.sbt). Actions does NOT
+  # export GITHUB_TOKEN as an env var on its own — only GITHUB_ACTOR — so without this
+  # mapping the credential is EMPTY and resolution falls back to whatever the Coursier
+  # cache happens to hold. That passes until a cache miss, then fails as a dependency
+  # error that looks nothing like a code problem.
+  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
 jobs:
   dev-publish:

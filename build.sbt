@@ -39,7 +39,32 @@ ThisBuild / scalacOptions ++= Seq(
   "-Wunused:all"
 )
 
+// The `io.codex` contract jars (Lexicon) are published to GitHub Packages, not Maven Central, so
+// a resolver and a credential are both required. The packages are marked "public", but GitHub's
+// Maven registry still answers 401 to an anonymous request (verified 2026-11-03) — so "public"
+// does not mean "anonymously resolvable" here, and a clean machine or CI runner cannot resolve
+// lexicon-grpc at all. A developer who has run `publishLocal` in the-lexicon resolves it from
+// ~/.ivy2/local and never notices.
+//
+// GitHub Actions supplies GITHUB_ACTOR and a GITHUB_TOKEN automatically; the job needs
+// `permissions: packages: read` (set in every workflow that runs sbt). No stored secret is
+// required or wanted: a long-lived PAT in repo secrets would be readable by any workflow.
+// Locally, export GITHUB_TOKEN with read:packages (`export GITHUB_TOKEN=$(gh auth token)`).
+// The credential is read from the environment and never committed.
+ThisBuild / resolvers +=
+  "Lexicon (GitHub Packages)" at "https://maven.pkg.github.com/vezril/the-lexicon"
+
+ThisBuild / credentials += Credentials(
+  "GitHub Package Registry",
+  "maven.pkg.github.com",
+  sys.env.getOrElse("GITHUB_ACTOR", "vezril"),
+  sys.env.getOrElse("GITHUB_TOKEN", "")
+)
+
 lazy val pekkoVersion = "1.2.0"
+// the-lexicon tag v0.8.0, published to GitHub Packages. Carries the Apollo object-API stubs
+// (ObjectApiClient) for the phase-2 pre-write snapshot. Pekko stays 1.2.0 across the classpath.
+lazy val lexiconVersion = "0.8.0"
 lazy val pekkoHttpVersion = "1.2.0"
 lazy val scalaTestVersion = "3.2.19"
 lazy val logbackVersion = "1.5.16"
@@ -90,6 +115,11 @@ lazy val server = (project in file("server"))
       // vault is the source of truth and this index is rebuildable from it).
       "org.postgresql" % "postgresql" % postgresVersion,
       "com.zaxxer" % "HikariCP" % hikariVersion,
+      // Apollo object-API contract (generated stubs + ObjectApiClient), published from
+      // the-lexicon. No codegen and no extra module here. Used by the phase-2 pre-write
+      // snapshot: every vault write saves the prior bytes to Apollo first, and refuses if it
+      // cannot (fail closed — the snapshot IS the undo button, since the vault is not in git).
+      "io.codex" %% "lexicon-grpc" % lexiconVersion,
       "ch.qos.logback" % "logback-classic" % logbackVersion,
       // Structured JSON logs (the constellation log schema).
       "net.logstash.logback" % "logstash-logback-encoder" % logstashEncoderVersion,
