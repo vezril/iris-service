@@ -5,7 +5,8 @@ import com.google.protobuf.ByteString as ProtoBytes
 import io.grpc.{Status, StatusRuntimeException}
 import me.cference.iris.domain.{ContentHash, VaultPath}
 import org.apache.pekko.NotUsed
-import org.apache.pekko.stream.scaladsl.Source
+import org.apache.pekko.stream.Materializer
+import org.apache.pekko.stream.scaladsl.{Sink, Source}
 import org.slf4j.LoggerFactory
 
 import java.security.MessageDigest
@@ -39,7 +40,9 @@ final class ApolloSnapshotStore(
     bucket: String,
     callTimeout: FiniteDuration,
     chunkSize: Int = 256 * 1024
-) extends SnapshotStore:
+)(using mat: Materializer)
+    extends SnapshotStore
+    with SnapshotArchive:
 
   private val log = LoggerFactory.getLogger(getClass)
 
@@ -144,6 +147,17 @@ final class ApolloSnapshotStore(
       case other =>
         SnapshotError.Unavailable(Option(other.getMessage).getOrElse(other.getClass.getName))
 
+  /**
+   * Read-side classification. Identical to [[classify]] except that NOT_FOUND means the object is
+   * absent rather than the bucket being gone — the same status code carries a different meaning on
+   * a get than on a put, and collapsing the two would report a missing snapshot as an outage.
+   */
+  private def classifyRead(e: Throwable): SnapshotError =
+    e match
+      case s: StatusRuntimeException if s.getStatus.getCode == Status.Code.NOT_FOUND =>
+        SnapshotError.NotFound(Option(s.getStatus.getDescription).getOrElse("not in the archive"))
+      case other => classify(other)
+
   private def md5Hex(bytes: Array[Byte]): String =
     MessageDigest.getInstance("MD5").digest(bytes).map("%02x".format(_)).mkString
 
@@ -151,3 +165,61 @@ final class ApolloSnapshotStore(
     val crc = new CRC32C()
     crc.update(bytes, 0, bytes.length)
     f"${crc.getValue}%08x"
+
+  // --- the read half: SnapshotArchive -------------------------------------------
+
+  /**
+   * List by the `notes/<path>/` prefix, which is exactly why the key layout is path-prefixed rather
+   * than purely content-addressed — this question has a cheap answer only if the keys are grouped
+   * by note.
+   *
+   * Newest first by `generation`. Apollo's listing is served from a read model and is eventually
+   * consistent, so a just-taken snapshot can legitimately be missing here.
+   */
+  def list(path: VaultPath, limit: Int): Either[SnapshotError, Vector[SnapshotEntry]] =
+    val prefix = s"notes/${path.value}/"
+    try
+      val response = Await.result(
+        api.listObjects(
+          ListObjectsRequest(bucket = bucket, prefix = prefix, pageSize = limit)
+        ),
+        callTimeout
+      )
+      val entries = response.objects.toVector.flatMap { e =>
+        // The sha is the final path segment of the key we wrote. Anything that does not parse as
+        // one is not ours and is skipped rather than guessed at.
+        ContentHash.parse(e.`object`.stripPrefix(prefix)).toOption.map { sha =>
+          SnapshotEntry(sha256 = sha, size = e.size, generation = e.generation)
+        }
+      }
+      Right(entries.sortBy(-_.generation))
+    catch case NonFatal(e) => Left(classifyRead(e))
+
+  def fetch(path: VaultPath, sha256: ContentHash): Either[SnapshotError, Array[Byte]] =
+    val key = objectKey(path, sha256)
+    try
+      val chunks = Await.result(
+        api
+          .getObject(GetObjectRequest(bucket = bucket, `object` = key))
+          .runWith(Sink.seq),
+        callTimeout
+      )
+      val bytes = chunks
+        .collect { case GetObjectResponse(GetObjectResponse.Payload.Chunk(c), _) =>
+          c.toByteArray
+        }
+        .flatten
+        .toArray
+
+      // Verify on read, independently of anything Apollo claims. A snapshot that does not hash to
+      // its own name is corrupt, and offering it as a restore candidate is worse than reporting
+      // that there is nothing to restore.
+      val actual = ContentHash.ofBytes(bytes)
+      if actual != sha256 then
+        Left(
+          SnapshotError.Rejected(
+            s"snapshot $key hashes to ${actual.value}, not the ${sha256.value} it is filed under"
+          )
+        )
+      else Right(bytes)
+    catch case NonFatal(e) => Left(classifyRead(e))
