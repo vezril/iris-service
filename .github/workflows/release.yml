@@ -32,7 +32,11 @@ env:
 jobs:
   release:
     name: Test, build, and publish
-    runs-on: ubuntu-latest
+    # PINNED for the same reason as ci.yml's test job: `ubuntu-latest` has migrated to Ubuntu 26
+    # (image ubuntu26/*), which provides no Docker environment. This job needs one TWICE over —
+    # `sbt test` runs the three testcontainers specs, and `server/Docker/publishLocal` needs a
+    # daemon to build the image at all. On Ubuntu 26 a tag push fails instead of releasing.
+    runs-on: ubuntu-24.04
     if: github.repository_owner == 'vezril'
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
