@@ -209,3 +209,74 @@ class NoteRepositorySpec extends AnyWordSpec with Matchers with TestContainerFor
       }
     }
   }
+
+  "recentScans" should {
+
+    "return nothing before any scan completes — not a zero-valued row" in withContainers { c =>
+      withRepo(c) { (repo, _) =>
+        repo.recentScans(20) shouldBe empty
+      }
+    }
+
+    "return completed scans newest first, carrying both ends of each" in withContainers { c =>
+      withRepo(c) { (repo, _) =>
+        repo.recordScan(ScanSummary("full", now, now.plusSeconds(94), 5917, 5917, 0, 0, 3))
+        repo.recordScan(
+          ScanSummary("watch", now.plusSeconds(600), now.plusSeconds(602), 5917, 0, 1, 0, 0)
+        )
+
+        val scans = repo.recentScans(20)
+        scans.map(_.kind) shouldBe Vector("watch", "full")
+        scans.head.startedAt shouldBe now.plusSeconds(600)
+        scans.head.finishedAt shouldBe now.plusSeconds(602)
+        scans(1).errors shouldBe 3
+        scans(1).created shouldBe 5917
+      }
+    }
+
+    "respect the limit" in withContainers { c =>
+      withRepo(c) { (repo, _) =>
+        (1 to 5).foreach { i =>
+          repo.recordScan(ScanSummary("full", now, now.plusSeconds(i.toLong), i, 0, 0, 0, 0))
+        }
+        repo.recentScans(3).map(_.notesSeen) shouldBe Vector(5, 4, 3)
+      }
+    }
+
+    /**
+     * The head of the history and the gauge must agree. If the two surfaces ordered differently,
+     * the console would show a "latest scan" card contradicting the scan at the top of its own list
+     * — the exact kind of quiet disagreement this project treats as a lie.
+     */
+    "agree with the metrics surface about which scan is latest" in withContainers { c =>
+      withRepo(c) { (repo, _) =>
+        // Same finished_at, so only the id tie-break can decide. Both surfaces order by
+        // finished_at DESC, id DESC, so the later INSERT must win in both.
+        repo.recordScan(ScanSummary("full", now, now.plusSeconds(10), 1, 0, 0, 0, 0))
+        repo.recordScan(ScanSummary("watch", now, now.plusSeconds(10), 2, 0, 0, 0, 0))
+
+        val head = repo.recentScans(20).head
+        val gauge = repo.indexMetrics().lastScan
+        head.kind shouldBe "watch"
+        gauge.map(_.kind) shouldBe Some(head.kind)
+        gauge.map(_.notesSeen) shouldBe Some(head.notesSeen)
+        gauge.map(_.finishedAt) shouldBe Some(head.finishedAt)
+      }
+    }
+
+    "exclude an in-flight scan, matching the metrics surface" in withContainers { c =>
+      withRepo(c) { (repo, ds) =>
+        repo.recordScan(ScanSummary("full", now, now.plusSeconds(5), 1, 1, 0, 0, 0))
+        val conn = ds.getConnection
+        try
+          val ps = conn.prepareStatement(
+            "INSERT INTO scans (kind, started_at, finished_at) VALUES ('full', ?, NULL)"
+          )
+          ps.setTimestamp(1, java.sql.Timestamp.from(now.plusSeconds(600)))
+          ps.executeUpdate()
+        finally conn.close()
+
+        repo.recentScans(20).map(_.finishedAt) shouldBe Vector(now.plusSeconds(5))
+      }
+    }
+  }

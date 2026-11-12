@@ -329,6 +329,39 @@ final class NoteRepository(ds: DataSource) extends NoteQueries with IndexMetrics
       finally ps.close()
     }
 
+  /**
+   * Ordered by `finished_at DESC, id DESC` — the same tie-break `lastCompletedScan` uses, so the
+   * head of this list is always the row `/metrics` is reporting. Two scans finishing inside the
+   * same clock tick would otherwise be free to disagree between the two surfaces.
+   */
+  override def recentScans(limit: Int): Vector[ScanRecord] =
+    withConnection { conn =>
+      val ps = conn.prepareStatement(
+        """SELECT kind, started_at, finished_at, notes_seen, created, changed, deleted, errors
+          |  FROM scans
+          | WHERE finished_at IS NOT NULL
+          | ORDER BY finished_at DESC, id DESC
+          | LIMIT ?""".stripMargin
+      )
+      try
+        ps.setInt(1, limit)
+        val rs = ps.executeQuery()
+        val out = Vector.newBuilder[ScanRecord]
+        while rs.next() do
+          out += ScanRecord(
+            kind = rs.getString(1),
+            startedAt = rs.getTimestamp(2).toInstant,
+            finishedAt = rs.getTimestamp(3).toInstant,
+            notesSeen = rs.getInt(4),
+            created = rs.getInt(5),
+            changed = rs.getInt(6),
+            deleted = rs.getInt(7),
+            errors = rs.getInt(8)
+          )
+        out.result()
+      finally ps.close()
+    }
+
   override def linkGraph(path: String, depth: Int, nodeCap: Int): Option[LinkGraph] =
     withConnection { conn =>
       exactPath(conn, path).map { root =>

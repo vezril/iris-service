@@ -170,6 +170,11 @@ After any bulk event, verify `postgres index count == mirror .md count` and rein
 - `GET /health` on :8080 (200 UP / 503 during shutdown drain) — probe target.
 - `GET /metrics` on :8080 — Prometheus text exposition, per `codex/docs/observability.md`
   (health/metrics on the service port). Content-free: counts, timestamps, scan outcomes only.
+- `GET /scans?limit=N` on :8080 — the scan **history** (default 20, max 200), newest first, each row
+  carrying `startedAt` **and** `finishedAt` so a reader can see how long a scan took. A gauge cannot
+  carry a series, so `/metrics` publishes only the latest completed scan; this keeps a bad run
+  visible after the next one has overwritten the gauges. Completed scans only (in-flight rows
+  excluded, matching `/metrics`), and content-free on the same terms.
 - Sidecar liveness: process exit → container restart (k8s default).
 - Logs: `LOG_FORMAT=json` (the image default) → constellation structured-log shape.
 

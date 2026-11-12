@@ -21,6 +21,8 @@ final class NoteRoutes(queries: NoteQueries, triggerReindex: () => Unit):
   private val DefaultLimit = 50
   private val MaxDepth = 3
   private val GraphNodeCap = 200
+  private val MaxScanLimit = 200
+  private val DefaultScanLimit = 20
 
   def routes: Route =
     pathPrefix("notes") {
@@ -63,6 +65,18 @@ final class NoteRoutes(queries: NoteQueries, triggerReindex: () => Unit):
       } ~
       path("links" / "unresolved") {
         get(complete(JsArray(queries.unresolvedTargets().map(_.toJson)*)))
+      } ~
+      // Scan history. `/metrics` publishes only the latest completed scan, because a gauge cannot
+      // carry a series; this is the same bookkeeping as a list, so a bad run stays visible after
+      // the next one has overwritten the gauges. Counts and timestamps only — no vault content.
+      path("scans") {
+        get {
+          parameters("limit".as[Int].withDefault(DefaultScanLimit)) { limit =>
+            if limit < 1 || limit > MaxScanLimit then
+              badRequest(s"limit must be between 1 and $MaxScanLimit")
+            else complete(JsArray(queries.recentScans(limit).map(_.toJson)*))
+          }
+        }
       } ~
       path("graph") {
         get {

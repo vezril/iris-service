@@ -42,7 +42,15 @@ jobs:
 
   build-test:
     name: Compile & test
-    runs-on: ubuntu-latest
+    # PINNED, and load-bearing. `ubuntu-latest` migrated to Ubuntu 26 (image ubuntu26/20261101.186),
+    # whose runner provides no Docker environment testcontainers can find — so NoteRepositorySpec,
+    # IndexReconcilerSpec and VaultWatcherSpec all ABORT, and with them every test that touches
+    # Postgres. The last green run on 24.04 (2026-11-04) ran them for real.
+    #
+    # The failure mode is the dangerous kind: the job goes red, but if anyone had made these suites
+    # skip-on-no-Docker instead, it would have gone GREEN with a third of the suite silently not
+    # running. Revisit only once Docker is confirmed working on the newer image.
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
