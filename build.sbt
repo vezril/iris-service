@@ -72,7 +72,7 @@ lazy val logstashEncoderVersion = "8.0"
 lazy val snakeYamlVersion = "2.3"
 lazy val postgresVersion = "42.7.4"
 lazy val hikariVersion = "6.2.1"
-lazy val testcontainersScalaVersion = "0.41.4"
+lazy val testcontainersScalaVersion = "0.43.0"
 
 // --- root: aggregate only, not published -------------------------------------
 lazy val root = (project in file("."))
@@ -105,6 +105,17 @@ lazy val server = (project in file("server"))
     // Forked run: main() returns after wiring async boot; the (non-daemon) Pekko
     // threads keep the forked JVM alive. Unforked, sbt would exit the app at return.
     Compile / run / fork := true,
+    // docker-java advertises Engine API 1.32 unless told otherwise, and a current Docker Engine
+    // rejects anything below 1.40 — which aborts NoteRepositorySpec, IndexReconcilerSpec and
+    // VaultWatcherSpec with "client version 1.32 is too old. Minimum supported API version is
+    // 1.40". The lever is docker-java's `api.version` SYSTEM PROPERTY; the DOCKER_API_VERSION
+    // environment variable is not read (measured in apollo-storage, which hit this first). Tests
+    // must therefore be forked for the property to reach the client.
+    //
+    // This is the fix for the real cause. Pinning the runner to an older image also made the
+    // symptom go away, by pairing an old client with an old daemon — but it only deferred this.
+    Test / fork := true,
+    Test / javaOptions += "-Dapi.version=1.43",
     libraryDependencies ++= Seq(
       "org.apache.pekko" %% "pekko-actor-typed" % pekkoVersion,
       "org.apache.pekko" %% "pekko-stream" % pekkoVersion,

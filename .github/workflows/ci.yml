@@ -42,15 +42,15 @@ jobs:
 
   build-test:
     name: Compile & test
-    # PINNED, and load-bearing. `ubuntu-latest` migrated to Ubuntu 26 (image ubuntu26/20261101.186),
-    # whose runner provides no Docker environment testcontainers can find — so NoteRepositorySpec,
-    # IndexReconcilerSpec and VaultWatcherSpec all ABORT, and with them every test that touches
-    # Postgres. The last green run on 24.04 (2026-11-04) ran them for real.
+    # NoteRepositorySpec, IndexReconcilerSpec and VaultWatcherSpec need a Docker daemon
+    # (testcontainers). A flaky runner that cannot reach one makes all three ABORT with
+    # "Previous attempts to find a Docker environment failed" — seen once on 2026-11-12. That is a
+    # transient, not the Ubuntu 26 runner image: sibling repos pass with testcontainers on the very
+    # same image build. First response is to RE-RUN the job, not to pin the runner.
     #
-    # The failure mode is the dangerous kind: the job goes red, but if anyone had made these suites
-    # skip-on-no-Docker instead, it would have gone GREEN with a third of the suite silently not
-    # running. Revisit only once Docker is confirmed working on the newer image.
-    runs-on: ubuntu-24.04
+    # Worth keeping in mind: the job goes red in that case. If these suites were ever made
+    # skip-on-no-Docker instead, CI would go GREEN with a third of the suite silently not running.
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
