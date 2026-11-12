@@ -34,7 +34,10 @@ env:
 jobs:
   dev-publish:
     name: Test and publish dev image
-    runs-on: ubuntu-latest
+    # PINNED, same reason as release.yml: `sbt test` runs the three testcontainers specs and
+    # `server/Docker/publishLocal` needs a Docker daemon, neither of which `ubuntu-latest` provides
+    # since it migrated to Ubuntu 26.
+    runs-on: ubuntu-24.04
     if: github.repository_owner == 'vezril'
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
