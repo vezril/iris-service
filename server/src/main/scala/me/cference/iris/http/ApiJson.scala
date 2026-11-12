@@ -35,6 +35,7 @@ object ApiJson extends SprayJsonSupport with DefaultJsonProtocol:
   given RootJsonFormat[BacklinkView] = jsonFormat2(BacklinkView.apply)
   given RootJsonFormat[TagCount] = jsonFormat2(TagCount.apply)
   given RootJsonFormat[UnresolvedTarget] = jsonFormat2(UnresolvedTarget.apply)
+  given RootJsonFormat[ScanRecord] = jsonFormat8(ScanRecord.apply)
   given RootJsonFormat[GraphNode] = jsonFormat2(GraphNode.apply)
   given RootJsonFormat[GraphEdge] = jsonFormat2(GraphEdge.apply)
   given RootJsonFormat[LinkGraph] = jsonFormat3(LinkGraph.apply)

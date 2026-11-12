@@ -31,6 +31,12 @@ class NoteRoutesSpec extends AnyWordSpec with Matchers with ScalatestRouteTest:
     modifiedAt = now
   )
 
+  /** Newest first, as the repository orders them. */
+  private val scanHistory = Vector(
+    ScanRecord("watch", now.plusSeconds(600), now.plusSeconds(602), 5917, 0, 1, 0, 0),
+    ScanRecord("full", now, now.plusSeconds(94), 5917, 5917, 0, 0, 3)
+  )
+
   private val reindexCalls = new AtomicInteger(0)
 
   private val stub = new NoteQueries:
@@ -44,6 +50,7 @@ class NoteRoutesSpec extends AnyWordSpec with Matchers with ScalatestRouteTest:
     def getNote(path: String) = Option.when(path == person.path)(person)
     def tagCounts() = Vector(TagCount("music", 3))
     def unresolvedTargets() = Vector(UnresolvedTarget("Missing Note", 2))
+    def recentScans(limit: Int) = scanHistory.take(limit)
     def linkGraph(path: String, depth: Int, nodeCap: Int) =
       Option.when(path == person.path)(
         LinkGraph(
@@ -107,6 +114,42 @@ class NoteRoutesSpec extends AnyWordSpec with Matchers with ScalatestRouteTest:
       }
       Get("/links/unresolved") ~> routes ~> check {
         responseAs[String] should include("Missing Note")
+      }
+    }
+  }
+
+  "GET /scans" should {
+    "serve the history newest first, with both ends of each scan" in {
+      Get("/scans") ~> routes ~> check {
+        status shouldBe StatusCodes.OK
+        val scans = responseAs[String].parseJson.asInstanceOf[JsArray].elements
+        scans should have size 2
+        val newest = scans.head.asJsObject
+        newest.fields("kind") shouldBe JsString("watch")
+        // Both timestamps, so a reader can see how long the scan took — /metrics cannot say.
+        newest.fields("startedAt") shouldBe JsString(now.plusSeconds(600).toString)
+        newest.fields("finishedAt") shouldBe JsString(now.plusSeconds(602).toString)
+        scans(1).asJsObject.fields("errors") shouldBe JsNumber(3)
+      }
+    }
+    "honour limit" in {
+      Get("/scans?limit=1") ~> routes ~> check {
+        status shouldBe StatusCodes.OK
+        responseAs[String].parseJson.asInstanceOf[JsArray].elements should have size 1
+      }
+    }
+    "reject a limit outside the bounds rather than silently clamping it" in {
+      Get("/scans?limit=0") ~> routes ~> check {
+        status shouldBe StatusCodes.BadRequest
+      }
+      Get("/scans?limit=201") ~> routes ~> check {
+        status shouldBe StatusCodes.BadRequest
+      }
+    }
+    "serve no vault content" in {
+      Get("/scans") ~> routes ~> check {
+        responseAs[String] should not include "dai-shihan"
+        responseAs[String] should not include "Alcvin"
       }
     }
   }
