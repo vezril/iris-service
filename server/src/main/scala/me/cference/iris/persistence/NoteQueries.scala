@@ -46,6 +46,20 @@ final case class TagCount(tag: String, notes: Long)
 final case class UnresolvedTarget(rawTarget: String, referencingNotes: Long)
 
 /**
+ * One top-level frontmatter key, aggregated across the index.
+ *
+ * **Content-free by construction: key names and value TYPES only, never values.** Key names are
+ * schema metadata of the same class as the tag names `/tags` already serves; a value is note
+ * content and belongs behind `/notes`. `types` maps a JSON type name (`string`, `number`,
+ * `boolean`, `array`, `object`, `null`) to how many notes carry that key at that type — so an
+ * inconsistently-typed key is visible as more than one entry rather than averaged away.
+ *
+ * @param notes
+ *   how many notes carry the key at all; equals the sum of `types`.
+ */
+final case class FrontmatterKey(key: String, notes: Long, types: Map[String, Long])
+
+/**
  * One completed scan, as the history endpoint reports it.
  *
  * Deliberately its own type rather than a reuse of the scanner's [[ScanSummary]] bookkeeping row or
@@ -92,6 +106,17 @@ trait NoteQueries:
 
   /** Unresolved (non-embed) link targets with how many notes reference them. */
   def unresolvedTargets(): Vector[UnresolvedTarget]
+
+  /**
+   * Top-level frontmatter keys and their value types, optionally restricted to a folder (exact or
+   * descendant, matching [[listNotes]]'s `folder` semantics).
+   *
+   * This is the mechanised form of the question `codex/docs/obsidian-bridge.md` assigns to Iris —
+   * how person/relationship data is actually encoded in frontmatter today, which drives Mnemosyne's
+   * parser — so that it is answered from the live index rather than guessed. Notes whose
+   * frontmatter is absent, unparseable, or not a YAML mapping contribute nothing.
+   */
+  def frontmatterKeys(folder: Option[String]): Vector[FrontmatterKey]
 
   /**
    * Completed scans, newest first, at most `limit` of them.

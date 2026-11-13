@@ -36,6 +36,21 @@ object ApiJson extends SprayJsonSupport with DefaultJsonProtocol:
   given RootJsonFormat[TagCount] = jsonFormat2(TagCount.apply)
   given RootJsonFormat[UnresolvedTarget] = jsonFormat2(UnresolvedTarget.apply)
   given RootJsonFormat[ScanRecord] = jsonFormat8(ScanRecord.apply)
+
+  /**
+   * Hand-written rather than derived: `types` is a Map, and the inherited collection formats are as
+   * ambiguous for Map under Scala 3 as they are for Vector (see above). Emitting it as a plain JSON
+   * object also reads better than an array of pairs.
+   */
+  given RootJsonFormat[FrontmatterKey] with
+    def write(k: FrontmatterKey): JsValue =
+      JsObject(
+        "key" -> JsString(k.key),
+        "notes" -> JsNumber(k.notes),
+        "types" -> JsObject(k.types.map((t, n) => t -> JsNumber(n)))
+      )
+    def read(json: JsValue): FrontmatterKey =
+      deserializationError("FrontmatterKey is response-only")
   given RootJsonFormat[GraphNode] = jsonFormat2(GraphNode.apply)
   given RootJsonFormat[GraphEdge] = jsonFormat2(GraphEdge.apply)
   given RootJsonFormat[LinkGraph] = jsonFormat3(LinkGraph.apply)

@@ -210,6 +210,89 @@ class NoteRepositorySpec extends AnyWordSpec with Matchers with TestContainerFor
     }
   }
 
+  "frontmatterKeys" should {
+
+    "aggregate keys, and report a key used at two types as two types" in withContainers { c =>
+      withRepo(c) { (repo, _) =>
+        repo.upsert(note("People/a.md", "---\nup: \"[[People Map]]\"\nborn: 1931\n---\nbody"))
+        repo.upsert(note("People/b.md", "---\nup:\n  - one\n  - two\n---\nbody"))
+
+        val byKey = repo.frontmatterKeys(None).map(k => k.key -> k).toMap
+        byKey("up").notes shouldBe 2L
+        byKey("up").types shouldBe Map("string" -> 1L, "array" -> 1L)
+        byKey("born").notes shouldBe 1L
+        byKey("born").types shouldBe Map("number" -> 1L)
+      }
+    }
+
+    "count notes per key as the sum of its types" in withContainers { c =>
+      withRepo(c) { (repo, _) =>
+        repo.upsert(note("a.md", "---\nk: one\n---\nbody"))
+        repo.upsert(note("b.md", "---\nk: 2\n---\nbody"))
+        repo.upsert(note("c.md", "---\nk: three\n---\nbody"))
+
+        val k = repo.frontmatterKeys(None).find(_.key == "k").get
+        k.notes shouldBe 3L
+        k.types.values.sum shouldBe k.notes
+      }
+    }
+
+    "restrict to a folder, exactly or by descent" in withContainers { c =>
+      withRepo(c) { (repo, _) =>
+        repo.upsert(note("Atlas/Notes/People/a.md", "---\nperson: yes\n---\nbody"))
+        repo.upsert(note("Atlas/Notes/People/Nested/b.md", "---\nperson: yes\n---\nbody"))
+        repo.upsert(note("Atlas/Notes/Groups/g.md", "---\ngroup: yes\n---\nbody"))
+
+        val people = repo.frontmatterKeys(Some("Atlas/Notes/People")).map(_.key)
+        people should contain("person")
+        people should not contain "group"
+        repo
+          .frontmatterKeys(Some("Atlas/Notes/People"))
+          .find(_.key == "person")
+          .get
+          .notes shouldBe 2L
+
+        // A trailing slash is the same ask, per listNotes' semantics.
+        repo.frontmatterKeys(Some("Atlas/Notes/People/")).map(_.key) should contain("person")
+      }
+    }
+
+    "ignore notes with no frontmatter" in withContainers { c =>
+      withRepo(c) { (repo, _) =>
+        repo.upsert(note("plain.md", "no frontmatter at all"))
+        repo.frontmatterKeys(None) shouldBe empty
+      }
+    }
+
+    /**
+     * The guard that keeps the query from erroring outright. `jsonb_each` refuses a non-object, and
+     * a note whose frontmatter is a valid YAML *list* stores exactly that — so one such note would
+     * otherwise take down the whole endpoint rather than merely being skipped. Inserted directly,
+     * because this asserts about the SQL and not about the parser's choices.
+     */
+    "skip a note whose frontmatter is not an object, rather than failing the query" in
+      withContainers { c =>
+        withRepo(c) { (repo, ds) =>
+          repo.upsert(note("good.md", "---\nk: v\n---\nbody"))
+
+          val conn = ds.getConnection
+          try
+            val ps = conn.prepareStatement(
+              """INSERT INTO notes
+                |  (path, folder, name, content_hash, size_bytes, modified_at, frontmatter, body)
+                |VALUES ('listfm.md', '', 'listfm', ?, 1, now(), ?::jsonb, 'body')""".stripMargin
+            )
+            ps.setString(1, "c" * 64)
+            ps.setString(2, """["a","b"]""")
+            ps.executeUpdate()
+          finally conn.close()
+
+          val keys = repo.frontmatterKeys(None)
+          keys.map(_.key) shouldBe Vector("k")
+        }
+      }
+  }
+
   "recentScans" should {
 
     "return nothing before any scan completes — not a zero-valued row" in withContainers { c =>

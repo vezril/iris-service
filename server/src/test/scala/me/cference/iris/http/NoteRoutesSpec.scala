@@ -51,6 +51,14 @@ class NoteRoutesSpec extends AnyWordSpec with Matchers with ScalatestRouteTest:
     def tagCounts() = Vector(TagCount("music", 3))
     def unresolvedTargets() = Vector(UnresolvedTarget("Missing Note", 2))
     def recentScans(limit: Int) = scanHistory.take(limit)
+    def frontmatterKeys(folder: Option[String]) =
+      if folder.contains("Atlas/Notes/People") then
+        Vector(FrontmatterKey("up", 164, Map("string" -> 160, "array" -> 4)))
+      else
+        Vector(
+          FrontmatterKey("up", 200, Map("string" -> 196, "array" -> 4)),
+          FrontmatterKey("tags", 95, Map("array" -> 95))
+        )
     def linkGraph(path: String, depth: Int, nodeCap: Int) =
       Option.when(path == person.path)(
         LinkGraph(
@@ -150,6 +158,38 @@ class NoteRoutesSpec extends AnyWordSpec with Matchers with ScalatestRouteTest:
       Get("/scans") ~> routes ~> check {
         responseAs[String] should not include "dai-shihan"
         responseAs[String] should not include "Alcvin"
+      }
+    }
+  }
+
+  "GET /frontmatter/keys" should {
+    "serve keys with their value-type spread" in {
+      Get("/frontmatter/keys") ~> routes ~> check {
+        status shouldBe StatusCodes.OK
+        val keys = responseAs[String].parseJson.asInstanceOf[JsArray].elements
+        keys should have size 2
+        val up = keys.head.asJsObject
+        up.fields("key") shouldBe JsString("up")
+        up.fields("notes") shouldBe JsNumber(200)
+        // An inconsistently-typed key shows BOTH types rather than one averaged answer.
+        up.fields("types").asJsObject.fields("string") shouldBe JsNumber(196)
+        up.fields("types").asJsObject.fields("array") shouldBe JsNumber(4)
+      }
+    }
+    "pass the folder filter through" in {
+      Get("/frontmatter/keys?folder=Atlas/Notes/People") ~> routes ~> check {
+        status shouldBe StatusCodes.OK
+        val keys = responseAs[String].parseJson.asInstanceOf[JsArray].elements
+        keys should have size 1
+        keys.head.asJsObject.fields("notes") shouldBe JsNumber(164)
+      }
+    }
+    "serve no frontmatter VALUES — only key and type names" in {
+      Get("/frontmatter/keys") ~> routes ~> check {
+        // "[[People Map]]" is the stub note's actual `up` value; the shape endpoint must not leak
+        // it, nor any body text.
+        responseAs[String] should not include "People Map"
+        responseAs[String] should not include "dai-shihan"
       }
     }
   }
