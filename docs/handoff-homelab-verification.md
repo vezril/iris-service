@@ -77,13 +77,21 @@ cd ~/Code/Olympus/iris-service
 sbt -batch "scalafmtCheckAll; scalafmtSbtCheck; compile; Test/compile; test"
 ```
 
-Expected, matching the last CI run: **core 47/47 (6 suites)**, **server 54/54 (10 suites)**,
-`aborted 0`. If the server count is lower and you see
-`Could not find a valid Docker environment`, the runtime isn't reachable from the JVM — see §5.
+Expected, matching the last CI run (v0.4.0, 2026-11-12): **core 105/105 (9 suites)**,
+**server 132/132 (14 suites)**, `aborted 0`. Measured, not estimated — core by running
+`sbt core/test` here, server from the release run's own log.
+
+*(The figures this section carried until 2026-11-13 — core 47/47, server 54/54 — were from
+2026-11-02 and had been overtaken by phase 2, the snapshot archive and `GET /scans`.)*
+
+If the server count is lower and you see `Could not find a valid Docker environment`, the runtime
+isn't reachable from the JVM — see §5.
 
 **What a failure here means:** `NoteRepositorySpec` is the one carrying the metrics SQL
 (`indexMetrics`: NULL handling on a fresh index, last-*completed*-scan ordering, the in-flight-scan
-exclusion, the shortfall gap). Those four cases already failed once on shared-container state
+exclusion, the shortfall gap) and, since v0.4.0, the `recentScans` history — including the case
+asserting that the history's head is the same scan `/metrics` reports, tie-break included. Those
+four metrics cases already failed once on shared-container state
 leakage and were fixed by truncating in `withRepo`; if they fail again, check whether a newly added
 test asserts on an aggregate without that isolation.
 
@@ -181,6 +189,26 @@ Confirm against `docs/run-shape.md` ("What the gauges can and cannot tell Hera")
 - **Colima**: `export DOCKER_HOST=unix://$HOME/.colima/default/docker.sock`.
 - Verify with `docker info` before blaming sbt.
 
+**Read the whole error before concluding the runtime is missing.** A reachable daemon fails the
+same way if the *client* is too old, and the message says which:
+
+```
+UnixSocketClientProviderStrategy: failed with
+Status 400: client version 1.32 is too old.
+           Minimum supported API version is 1.40
+```
+
+docker-java advertises Engine API 1.32 unless told otherwise, and a current Docker Engine refuses
+anything below 1.40 — so all three suites abort with Docker running fine. This bit CI on
+2026-11-12 and cost two wrong diagnoses (first "the Ubuntu 26 runner has no Docker", then "it's a
+flaky runner") before the log was read to the end.
+
+`build.sbt` already carries the fix — `Test / fork := true` plus
+`Test / javaOptions += "-Dapi.version=1.43"` — so a fresh clone should not see it. If you do, check
+that those two settings survived a merge. Note that bumping testcontainers-scala does **not**
+substitute for the property: 0.43.0 still resolves docker-java 3.4.0, whose default is
+`UNKNOWN_VERSION` → 1.32 (measured by the Ariadne session).
+
 ## 6. Record the outcome here
 
 Append results below, including anything that contradicts this document — the quiesce timings
@@ -193,8 +221,16 @@ overwrite them rather than sit alongside them.
 
 ## Still open, and not for this pickup
 
-Needs Calvin's own word (per `AGENTS.md`): **phase 2 safe writes** (a fresh-review gate in the
-design doc), **`iris-ui`** (no directory exists yet), and a **sidecar-side wedge detector**
-(`ob sync-status --json` exists; Iris can't reach it — net-new scope).
+Two items this section listed as open have since shipped: **phase 2 safe writes** (v0.3.0, still
+`enabled = false` by default) and **`iris-ui`** (v0.1.0, image published, not deployed).
+
+Still needs Calvin's own word (per `AGENTS.md`): a **sidecar-side wedge detector**
+(`ob sync-status --json` exists; Iris can't reach it — net-new scope), and the **deploy** — the
+HelmRelease still pins `calvinference/iris:0.1.1` while `0.4.0` and `irisui:0.1.0` sit published
+and unrolled. Roll the service before the console: iris-ui's scan-history card needs
+iris-service > v0.3.0 and renders a 404 failure state against 0.1.1.
+
 Blocked on another session: the **Lexicon `vault.proto`** contract, which keeps the Hermes
-`vault.note.*` feed flag-off.
+`vault.note.*` feed flag-off (re-checked 2026-11-13 — no vault protos in the-lexicon yet; the
+proposal is `docs/vault-proto-proposal.md`). Also note the envelope `correlation_id` needs
+hermesmq ≥ 1.13.0 and the cluster runs 1.11.0.
