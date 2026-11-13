@@ -52,6 +52,21 @@ of personal knowledge. So Iris is conservative by construction:
    per write, conflict surfacing.
 3. **First consumer** — Mnemosyne builds on the proven bridge.
 
+### Phase-3 groundwork: `GET /frontmatter/keys`
+
+The design doc's open question 3 asks **how person/relationship data is actually encoded in
+frontmatter today**, because that drives Mnemosyne's parser, and says the Iris session should answer
+it from the live index rather than anyone guessing. `GET /frontmatter/keys?folder=Atlas/Notes/People`
+is that query, mechanised: every top-level key, how many notes carry it, and at which JSON value
+types — so a key used inconsistently (`up` as a string in 160 notes, as a list in 4) shows up as
+two types rather than one averaged answer.
+
+**Content-free, like `/tags`:** key names and type names only, never values. A value is note
+content and stays behind `/notes`.
+
+It still needs a populated index to answer, so the actual answer waits on a deploy or a local run
+against a vault copy.
+
 ## Development
 
 Scala 3.3.4 + Pekko 1.2.0, two modules: `core/` (pure domain + vault parsing, zero Pekko) and

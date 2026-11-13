@@ -330,6 +330,48 @@ final class NoteRepository(ds: DataSource) extends NoteQueries with IndexMetrics
     }
 
   /**
+   * One pass over `jsonb_each`, grouped by key and value type, then folded into one row per key.
+   *
+   * `jsonb_typeof(frontmatter) = 'object'` is load-bearing, not defensive tidiness: `jsonb_each`
+   * ERRORS on a non-object, and a note whose frontmatter is a valid YAML list or scalar stores
+   * exactly that. Without the guard one such note fails the whole query.
+   *
+   * Values never leave the database — only key names and type names do.
+   */
+  override def frontmatterKeys(folder: Option[String]): Vector[FrontmatterKey] =
+    withConnection { conn =>
+      val folderClause =
+        if folder.isDefined then " AND (n.folder = ? OR n.folder LIKE ?)" else ""
+      val ps = conn.prepareStatement(
+        s"""SELECT e.key AS k, jsonb_typeof(e.value) AS vtype, count(*) AS n
+           |  FROM notes n, jsonb_each(n.frontmatter) AS e
+           | WHERE jsonb_typeof(n.frontmatter) = 'object'$folderClause
+           | GROUP BY e.key, jsonb_typeof(e.value)
+           | ORDER BY e.key""".stripMargin
+      )
+      try
+        folder.foreach { f =>
+          val base = f.stripSuffix("/")
+          ps.setString(1, base)
+          ps.setString(2, s"$base/%")
+        }
+        val rs = ps.executeQuery()
+        // LinkedHashMap keeps the SQL's key ordering while the type counts accumulate.
+        val acc = mutable.LinkedHashMap.empty[String, mutable.Map[String, Long]]
+        while rs.next() do
+          val key = rs.getString("k")
+          val vtype = Option(rs.getString("vtype")).getOrElse("null")
+          val n = rs.getLong("n")
+          acc
+            .getOrElseUpdate(key, mutable.LinkedHashMap.empty[String, Long])
+            .update(vtype, n)
+        acc.map { (key, types) =>
+          FrontmatterKey(key, types.values.sum, types.toMap)
+        }.toVector
+      finally ps.close()
+    }
+
+  /**
    * Ordered by `finished_at DESC, id DESC` — the same tie-break `lastCompletedScan` uses, so the
    * head of this list is always the row `/metrics` is reporting. Two scans finishing inside the
    * same clock tick would otherwise be free to disagree between the two surfaces.
